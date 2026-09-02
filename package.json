@@ -1,0 +1,30 @@
+{
+  "name": "axiom-siege",
+  "version": "1.0.0",
+  "description": "AXIOM SIEGE - a server-authoritative 3D multiplayer tactical browser FPS (original assets & names), powered by Cloudflare Workers + Durable Objects + Pages.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n client,server -c cyan,yellow \"npm:dev:client\" \"npm:dev:server\"",
+    "dev:client": "vite --config client/vite.config.ts",
+    "dev:server": "wrangler dev --config wrangler.toml --local --port 8787",
+    "build": "npm run build:client && npm run typecheck",
+    "build:client": "vite build --config client/vite.config.ts",
+    "preview:server": "wrangler dev --config wrangler.toml --local --port 8787",
+    "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p client/tsconfig.json --noEmit",
+    "test": "tsx tests/sim.test.ts",
+    "deploy": "npm run build:client && npx wrangler deploy --config wrangler.toml",
+    "cf:types": "wrangler types --config wrangler.toml"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240620.0",
+    "@types/node": "^20.14.0",
+    "@types/three": "^0.166.0",
+    "concurrently": "^8.2.2",
+    "three": "^0.166.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "wrangler": "^3.78.0"
+  }
+}

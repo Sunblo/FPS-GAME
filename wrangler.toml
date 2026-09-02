@@ -1,0 +1,36 @@
+name = "axiom-siege"
+main = "server/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Serve the built frontend (client/dist) from the same Worker.
+[assets]
+directory = "./client/dist"
+not_found_handling = "single-page-application"
+binding = "ASSETS"
+
+[[durable_objects.bindings]]
+name = "MATCHES"
+class_name = "MatchDO"
+
+[[durable_objects.bindings]]
+name = "LOBBIES"
+class_name = "LobbyDO"
+
+[[durable_objects.bindings]]
+name = "MATCHMAKER"
+class_name = "MatcherDO"
+
+[durable_objects]
+# Default SQLite-backed storage (required for alarms; optional but recommended).
+
+[vars]
+APP_NAME = "AXIOM SIEGE"
+APP_VERSION = "1.0.0"
+TICK_RATE = "30"
+MAX_PLAYERS = "10"
+BOT_NAME_PREFIX = "RIG"
+
+# Observability (optional).
+[observability]
+enabled = true
