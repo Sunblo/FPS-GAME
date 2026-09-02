@@ -1,13 +1,12 @@
 // MatchDO: authoritative host for one game (one per room code).
-// Runs the shared MatchSim at ~30Hz using wall-clock catch-up, steps a BotBrain
-// for all bot seats, and fans out snapshots + per-recipient events to clients.
+// Runs the shared MatchSim at ~30Hz using wall-clock catch-up, and fans out
+// snapshots + per-recipient events to clients.
 //
-// Roster model: a match always has `seats = teamSize*2` players. Seats start as
-// bots; when a human joins they take over an available bot seat (converted back
-// to a bot on disconnect). This keeps the match live even while players come
-// and go without restarting the simulation.
+// Roster model (multiplayer): humans only - bots are never seeded online. A
+// seat exists only while its human is connected; the sim holds warmup until
+// enough players have arrived (minPlayers), so rooms simply wait for people
+// instead of being padded with NPCs.
 import { MatchSim } from '../shared/sim.ts';
-import { BotBrain, botNames } from '../shared/bot.ts';
 import type { MatchEvt } from '../shared/sim.ts';
 import {
   headerOf, snapBodyOf,
@@ -42,10 +41,10 @@ export class MatchDO {
   state: DurableObjectState;
   env: Env;
   sim: MatchSim | null = null;
-  brain: BotBrain | null = null;
   teamSize = 5;
   seats: Seat[] = [];
   sessions = new Map<string, Session>();
+  nextSeat = 0;
   accPublic: MatchEvt[] = [];
   accPer = new Map<string, MatchEvt[]>();
   lastWall = Date.now();
@@ -68,37 +67,18 @@ export class MatchDO {
     this.ensureMatch();
     if (!this.sim) return new Response('no match', { status: 500 });
 
-    const sim = this.sim;
-    // find or create a seat for this human
-    let seat: Seat | undefined;
-    for (const s of this.seats) {
-      if (!s.human) { seat = s; break; }
+    if (this.seats.length >= this.teamSize * 2) {
+      return new Response(JSON.stringify({ error: 'room full' }), { status: 423 });
     }
-    if (!seat) {
-      // everyone is human - only allowed if humans under capacity
-      const hum = this.seats.filter((s) => s.human).length;
-      if (hum >= this.teamSize * 2) {
-        return new Response(JSON.stringify({ error: 'room full' }), { status: 423 });
-      }
-      const p = sim.addPlayer(idOf(this.seats.length), name);
-      seat = { id: p.id, human: true, session: null, name };
-      this.seats.push(seat);
-      // keep seat count balanced to teamSize*2
-      while (this.seats.length < this.teamSize * 2) {
-        const bp = sim.addPlayer(idOf(this.seats.length), botNames(9)[0]);
-        bp.isBot = true; bp.online = false;
-        this.seats.push({ id: bp.id, human: false, session: null, name: bp.name });
-      }
-      this.rebuildBrain();
-    } else {
-      const p = sim.players.get(seat.id);
-      if (p) {
-        p.isBot = false; p.online = true;
-        p.name = name;
-      }
-      seat.human = true;
-      seat.name = name;
-    }
+
+    // fresh human-only seat; teams stay balanced by join order
+    let pid = this.freshId();
+    const p = this.sim.addPlayer(pid, name);
+    pid = p.id;
+    p.online = true;
+    const seat: Seat = { id: pid, human: true, session: null, name };
+    this.seats.push(seat);
+    this.sim.quickSpawn(pid);
 
     // websocket handshake: return a fresh pair; the client gets 'client', the DO
     // keeps 'server'.
@@ -114,11 +94,10 @@ export class MatchDO {
     server.addEventListener('close', () => this.onClose(sess));
     server.addEventListener('error', () => this.onClose(sess));
 
-    const p = this.sim.players.get(seat.id);
     const joined: OutMsg = {
       t: 'joined',
       id: seat.id,
-      team: p ? p.team : 1,
+      team: p.team,
       yourIndex: seatIdxOf(this.seats, seat),
       header: headerOf(this.sim),
     };
@@ -131,34 +110,31 @@ export class MatchDO {
 
   private ensureMatch(): void {
     if (this.sim) {
-      // reuse while live; if humans all gone & match over, reset for next group
-      const humans = this.seats.filter((s) => s.human && s.session);
-      if (this.sim.phase !== 'matchover' || humans.length > 0) return;
+      // reuse while live; if everyone left & the match ended, reset for the next
+      // group so a fresh room isn't stuck in a finished match
+      const humans = this.seats.filter((s) => s.human && s.session).length;
+      if (this.sim.phase !== 'matchover' || humans > 0) return;
     }
     this.sim = new MatchSim({
       map: 'REACTOR-09', tickRate: 30, firstTo: 13, teamSize: this.teamSize,
-      ot: true, warmup: true,
+      ot: true, warmup: true, minPlayers: 2,
     });
     this.sim.onLog = (s) => console.log('[sim]', s);
     this.sim.warmupLeft = 8;
+    this.sim.phaseUntil = this.sim.now + 8;
     this.seats = [];
-    this.brain = null;
-    // seed seats as bots up to capacity
-    const names = botNames(this.teamSize * 2 * 2);
-    for (let i = 0; i < this.teamSize * 2; i++) {
-      const id = idOf(i);
-      const p = this.sim.addPlayer(id, names[i]);
-      p.isBot = true; p.online = false;
-      this.seats.push({ id, human: false, session: null, name: names[i] });
-    }
-    this.rebuildBrain();
+    this.nextSeat = 0;
     this.ttl = Date.now() + 60_000;
   }
 
-  private rebuildBrain(): void {
-    if (!this.sim) return;
-    // re-create so its player mirror matches seats; players don't change id/team
-    this.brain = new BotBrain(this.sim, 0.8);
+  private freshId(): string {
+    if (!this.sim) return 'P01';
+    for (let i = 0; i < 1000; i++) {
+      const n = this.nextSeat++;
+      const id = 'P' + (n + 1).toString().padStart(2, '0');
+      if (!this.sim.players.has(id)) return id;
+    }
+    return 'P' + (this.nextSeat + 1).toString().padStart(2, '0');
   }
 
   // --- messaging ---------------------------------------------------------------
@@ -205,17 +181,14 @@ export class MatchDO {
     const seat = sess.seat;
     seat.session = null;
     this.sessions.delete(sess.key);
-    if (this.sim) {
-      const p = this.sim.players.get(seat.id);
-      if (p && seat.human) {
-        // convert the vacated human seat back to a bot so play continues
-        p.isBot = true;
-        p.online = false;
-        seat.human = false;
-        seat.name = p.name;
-        if (this.brain) this.brain.step();
-      }
+    if (this.sim && seat.human) {
+      // Multiplayer rooms are humans-only: vacating the seat removes the player
+      // entirely. The sim gates round starts until enough players are present.
+      this.sim.evictPlayer(seat.id);
     }
+    this.seats = this.seats.filter((s) => s !== seat);
+    this.broadcast(true);
+    this.pump(false);
   }
 
   private findByWs(ws: WebSocket): Session | null {
@@ -235,7 +208,6 @@ export class MatchDO {
 
     const sim = this.sim;
     for (let i = 0; i < steps; i++) {
-      if (this.brain) this.brain.step();
       sim.step(SIM_DT);
       this.collectEvents();
       if (this.wantImmediate()) this.broadcast(false);
@@ -320,9 +292,6 @@ export class MatchDO {
   }
 }
 
-function idOf(n: number): string {
-  return 'P' + (n + 1).toString().padStart(2, '0');
-}
 function seatIdxOf(seats: Seat[], s: Seat): number {
   return seats.indexOf(s);
 }

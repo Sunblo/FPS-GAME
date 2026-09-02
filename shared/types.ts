@@ -186,6 +186,10 @@ export interface MatchConfig {
   ot: boolean;
   warmup: boolean;
   region?: string;
+  // Minimum number of live participants (humans + bots) needed before the
+  // match may leave warmup / start the next round. Used by online hosts so
+  // human-only rooms simply wait instead of seeding bots.
+  minPlayers?: number;
 }
 
 export interface PlayerMeta {

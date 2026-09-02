@@ -126,7 +126,7 @@ export class OnlineGame extends GameDriver {
   private _view: DriverView = {
     header: {
       ph: 'warmup', rnd: 1, scr: [0, 0], atkTeam: 1, plant: 0, boomIn: 0,
-      rt: 0, bt: 0, wt: 0, targetWin: 13,
+      rt: 0, bt: 0, wt: 0, targetWin: 13, pl: 0,
     },
     players: [], smokes: [], fires: [], simNow: 0,
     selfId: '', online: true,

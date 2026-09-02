@@ -66,6 +66,7 @@ export interface SnapHeader {
   bt: number;
   wt: number;
   targetWin: number;
+  pl: number; // participants present
 }
 
 export interface MsgJoined {
@@ -122,6 +123,7 @@ export function headerOf(sim: MatchSim): SnapHeader {
     ph: h.ph, rnd: h.rnd, scr: [h.scr[0], h.scr[1]],
     atkTeam: sim.attackerSide, plant: h.plant, boomIn: h.boomIn,
     rt: h.rt, bt: h.bt, wt: h.wt, targetWin: sim.targetWin,
+    pl: sim.participants(),
   };
 }
 

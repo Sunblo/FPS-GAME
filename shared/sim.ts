@@ -62,6 +62,9 @@ export interface MatchEvt extends SnapEvt {
 
 const rnd = Math.random;
 
+// Warmup countdown once enough participants are connected (online hosts).
+const WARMUP_READY = 6;
+
 function blank(team: Team): SimPlayer {
   return {
     id: '', name: '', team, isBot: false, online: false,
@@ -121,10 +124,12 @@ export class MatchSim {
   private dt = 1 / 30;
   paused = false;
   onLog?: (s: string) => void;
+  minPlayers = 0;
 
   constructor(cfg: MatchConfig) {
     this.cfg = cfg;
     this.targetWin = cfg.firstTo || FIRST_TO;
+    this.minPlayers = cfg.minPlayers ?? 0;
     this.warmupLeft = cfg.warmup === false ? 6 : WARMUP_TIME;
     this.phaseUntil = this.warmupLeft;
   }
@@ -150,12 +155,39 @@ export class MatchSim {
       }
     }
   }
+  // Hard eviction used by online hosts: the seat is gone for good (no bot
+  // fill-in), e.g. when a multiplayer-only room's human disconnects.
+  evictPlayer(id: string): void {
+    const p = this.players.get(id);
+    if (!p) return;
+    this.players.delete(id);
+    this.order = this.order.filter((o) => o !== id);
+    if (!p.isBot && this.participants() === 0) {
+      this.phase = 'matchover';
+    }
+  }
+  // Spawn an online participant without waiting for the respawn delay.
+  quickSpawn(id: string): void {
+    const p = this.players.get(id);
+    if (!p || p.isBot) return;
+    p.online = true;
+    p.deadT = -9; // lets warmup/next-tick spawn logic pick them up immediately
+    if (this.phase === 'warmup' && !p.alive) this.spawnPlayer(p);
+  }
   assignTeam(): Team {
     let a = 0, b = 0;
     for (const p of this.players.values()) {
       if (p.team === TEAM_ATTACK) a++; else if (p.team === TEAM_DEFEND) b++;
     }
     return a <= b ? TEAM_ATTACK : TEAM_DEFEND;
+  }
+  // Humans (online) plus bots: everything able to act in the sim.
+  participants(): number {
+    let n = 0;
+    for (const p of this.players.values()) {
+      if (p.isBot || (p.online && !p.isBot)) n++;
+    }
+    return n;
   }
   playersOfTeam(t: Team): SimPlayer[] {
     const out: SimPlayer[] = [];
@@ -815,7 +847,19 @@ export class MatchSim {
     switch (this.phase) {
       case 'warmup': {
         this.warmupLeft = Math.max(0, this.phaseUntil - this.now);
-        if (this.warmupLeft <= 0) { this.startFirstRound(); break; }
+        const ready = this.participants() >= this.minPlayers;
+        if (!ready) {
+          // Hold warmup (still lets players run around) until enough are here.
+          if (this.phaseUntil - this.now < WARMUP_TIME) this.phaseUntil = this.now + WARMUP_TIME;
+        } else if (this.phaseUntil - this.now > WARMUP_READY) {
+          // Enough players: stop stalling and get into the round soon.
+          this.phaseUntil = this.now + WARMUP_READY;
+        }
+        if (this.warmupLeft <= 0) {
+          if (this.roundNum === 0) this.startFirstRound();
+          else this.prepRound(this.attackerSide);
+          break;
+        }
         for (const p of this.players.values()) {
           if (!p.online && !p.isBot) continue;
           if (!p.alive) {
@@ -858,7 +902,16 @@ export class MatchSim {
         break;
       }
       case 'roundend': {
-        if (this.now >= this.phaseUntil) this.nextRound();
+        if (this.now >= this.phaseUntil) {
+          if (this.participants() >= this.minPlayers) {
+            this.nextRound();
+          } else {
+            // Back to waiting warmup instead of starting a lopsided round.
+            this.phase = 'warmup';
+            this.phaseUntil = this.now + WARMUP_TIME;
+            this.ev({ k: 'phase', ph: 'warmup', snd: 'round_start' });
+          }
+        }
         break;
       }
       case 'matchover':

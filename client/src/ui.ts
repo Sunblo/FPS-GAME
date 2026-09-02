@@ -198,7 +198,10 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
       sc.querySelector('.d')!.textContent = String(h.scr[1]);
       const sideT = h.atkTeam === 1 ? 'A' : 'D';
       let phase = '';
-      if (h.ph === 'warmup') { phase = 'WARMUP'; timer.textContent = fmt(h.wt); }
+      if (h.ph === 'warmup') {
+        phase = (h.pl ?? 0) < 2 ? `WARMUP · WAITING FOR PLAYERS (${h.pl ?? 0}/2)` : 'WARMUP';
+        timer.textContent = fmt(h.wt);
+      }
       else if (h.ph === 'freeze') { phase = `BUY · ROUND ${h.rnd}`; timer.textContent = fmt(h.bt); }
       else if (h.ph === 'live') {
         phase = h.plant > 0 ? 'BOMB ARMED · ' + (h.atkTeam === 1 ? 'ATTACK SIDE ' : 'DEF SIDE ') + sideT : `ROUND ${h.rnd}`;
