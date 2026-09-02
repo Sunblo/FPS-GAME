@@ -13,16 +13,12 @@ binding = "ASSETS"
 name = "MATCHES"
 class_name = "MatchDO"
 
-[[durable_objects.bindings]]
-name = "LOBBIES"
-class_name = "LobbyDO"
-
-[[durable_objects.bindings]]
-name = "MATCHMAKER"
-class_name = "MatcherDO"
-
 [durable_objects]
 # Default SQLite-backed storage (required for alarms; optional but recommended).
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MatchDO"]
 
 [vars]
 APP_NAME = "AXIOM SIEGE"

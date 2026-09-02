@@ -206,6 +206,15 @@ export class MatchSim {
       this.ev({ k: 'switch', to: p.id, snd: 'switch' });
     }
   }
+  switchToId(p: SimPlayer, id: string): void {
+    if (!p.alive || this.now < p.equipT) return;
+    const owned: string[] = ['knife', p.slots.pistol.id];
+    if (p.slots.primary.id) owned.push(p.slots.primary.id);
+    for (const k of Object.keys(UTILITIES)) if ((p.util[k] ?? 0) > 0) owned.push(k);
+    const idx = owned.indexOf(id);
+    if (idx < 0) return;
+    this.switchTo(p, idx);
+  }
   reload(p: SimPlayer): void {
     if (!p.alive || this.now < p.equipT || this.reloading(p)) return;
     const wd = WEAPONS[p.curW];
@@ -263,6 +272,11 @@ export class MatchSim {
       this.fireRay(p, wd, this.fwd3(aY, aP), warmup);
     }
     this.ev({ k: 'shot', to: p.id, snd: 'shot' });
+    if (wd.cat !== 'melee' && wd.cat !== 'lmg' && wd.cat !== 'shotgun') {
+      this.ev({ k: 'muzzle', id: p.id, w, x: p.x, y: p.y + this.eyeH(p), z: p.z, yaw: p.cmd.yaw, pitch: p.cmd.pitch });
+    } else {
+      this.ev({ k: 'muzzle', id: p.id, w, x: p.x, y: p.y + this.eyeH(p), z: p.z, yaw: p.cmd.yaw, pitch: p.cmd.pitch });
+    }
   }
 
   private shotSpread(wd: any, p: SimPlayer): number {
