@@ -13,6 +13,7 @@ export interface DriverView {
   smokes: SmokeInfo[];
   fires: FireInfo[];
   simNow: number;
+  simAge: number; // seconds since the newest snapshot was produced (for view extrapolation)
   selfId: string;
   online: boolean;
 }
@@ -32,6 +33,7 @@ export class PracticeGame extends GameDriver {
   brain: BotBrain | null;
   private humanId: string;
   private acc = 0;
+  private lastTickMs = 0;
   private frame: DriverView;
   private evQ: MatchEvt[] = [];
   private perTo: Map<string, MatchEvt[]> = new Map();
@@ -56,6 +58,7 @@ export class PracticeGame extends GameDriver {
       smokes: [],
       fires: [],
       simNow: 0,
+      simAge: 0,
       selfId: this.humanId,
       online: false,
     };
@@ -69,6 +72,7 @@ export class PracticeGame extends GameDriver {
       this.acc -= 1 / 30;
       if (this.brain) this.brain.step();
       this.sim.step(1 / 30);
+      this.lastTickMs = performance.now();
       const out = this.sim.flushEvents();
       for (const e of out.public) this.pub.push(e);
       for (const [id, list] of out.per) {
@@ -88,6 +92,7 @@ export class PracticeGame extends GameDriver {
       smokes: body.smokes,
       fires: body.fires,
       simNow: body.simNow,
+      simAge: Math.max(0, Math.min(0.06, (performance.now() - this.lastTickMs) / 1000)),
       selfId: this.humanId,
       online: false,
     };
@@ -128,11 +133,12 @@ export class OnlineGame extends GameDriver {
       ph: 'warmup', rnd: 1, scr: [0, 0], atkTeam: 1, plant: 0, boomIn: 0,
       rt: 0, bt: 0, wt: 0, targetWin: 13, pl: 0,
     },
-    players: [], smokes: [], fires: [], simNow: 0,
+    players: [], smokes: [], fires: [], simNow: 0, simAge: 0,
     selfId: '', online: true,
   };
   private selfId = '';
   private evQ: MatchEvt[] = [];
+  private snapAtMs = 0;
   private readyResolve: (() => void) | null = null;
   ready: Promise<void>;
   joined = false;
@@ -166,13 +172,19 @@ export class OnlineGame extends GameDriver {
       this._view.smokes = s.smokes;
       this._view.fires = s.fires;
       this._view.simNow = Date.now() / 1000; // best-effort sim clock alignment
+      this.snapAtMs = Date.now();
       for (const e of s.events) this.evQ.push(e);
     } else if (msg.t === 'kicked') {
       this.closed = true;
     }
   }
 
-  get view(): DriverView { return this._view; }
+  get view(): DriverView {
+    if (this.snapAtMs > 0) {
+      this._view.simAge = Math.max(0, Math.min(0.06, (Date.now() - this.snapAtMs) / 1000));
+    }
+    return this._view;
+  }
   step(): void { /* receive-driven */ }
   events(): MatchEvt[] {
     if (this.evQ.length === 0) return [];

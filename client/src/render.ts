@@ -10,6 +10,7 @@ import {
 } from '../../shared/mapdef.ts';
 import type { PState } from '../../shared/protocol.ts';
 import { makeCharacter, type CharRig } from './models.ts';
+import { buildViewModel, type VmHandle } from './vmodel.ts';
 
 interface PlayerDraw {
   group: THREE.Group;
@@ -38,6 +39,8 @@ export class World {
   private fx: { obj: THREE.Object3D; life: number; max: number; grow?: number }[] = [];
   private smokeTex: THREE.Texture;
   private hidden = new Set<string>();
+  private vm: VmHandle;
+  private tGeo: THREE.CylinderGeometry | null = null;
   private rnd = Math.random;
 
   constructor(container: HTMLElement) {
@@ -51,6 +54,11 @@ export class World {
 
     this.camera = new THREE.PerspectiveCamera(78, container.clientWidth / container.clientHeight, 4, 6000);
     this.camera.rotation.order = 'YXZ';
+    this.scene.add(this.camera);
+
+    this.vm = buildViewModel();
+    this.vm.root.visible = false;
+    this.camera.add(this.vm.root);
 
     this.buildSky();
     this.buildLights();
@@ -592,7 +600,7 @@ export class World {
   setCam(pos: { x: number; y: number; z: number }, yaw: number, pitch: number, duck: number): void {
     this.camera.position.set(pos.x, pos.y + (duck ? EYE_DUCK : EYE), pos.z);
     this.camera.rotation.y = yaw;
-    this.camera.rotation.x = -pitch;
+    this.camera.rotation.x = pitch;
   }
 
   get eyeY(): number { return EYE; }
@@ -627,12 +635,57 @@ export class World {
     }
   }
 
+  // ---- first-person viewmodel ----------------------------------------------
+  vmSet(w: string, team: number): void { this.vm.setWeapon(w, team); }
+  vmShow(v: boolean): void { this.vm.root.visible = v; }
+  vmUpdate(dt: number, opts: { speed: number; duck: boolean; using: boolean }): void {
+    this.vm.update(dt, { speed: opts.speed, duck: opts.duck ? 1 : 0, alive: this.vm.root.visible, using: opts.using });
+  }
+  vmKick(power: number): void { this.vm.kick(power); }
+
+  // flash at the tip of the held gun (own view) + recoil the viewmodel
+  ownMuzzle(x: number, y: number, z: number, big: boolean, power: number): void {
+    this.muzzle('', x, y, z, big);
+    this.vmKick(power);
+  }
+
   bulletSpark(x: number, y: number, z: number): void {
     const s = new THREE.Mesh(new THREE.SphereGeometry(1.8, 5, 4),
       new THREE.MeshBasicMaterial({ color: 0xfff3b0, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false }));
     s.position.set(x, y, z);
     this.scene.add(s);
     this.fx.push({ obj: s, life: 0.14, max: 0.14, grow: 6 });
+  }
+
+  // bullets are invisible rays; draw them as a short fading tracer beam
+  tracer(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number): void {
+    const vx = x1 - x0, vy = y1 - y0, vz = z1 - z0;
+    const len = Math.hypot(vx, vy, vz);
+    if (len < 6 || len > 3400) return;
+    if (!this.tGeo) this.tGeo = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true);
+    const m = new THREE.Mesh(
+      this.tGeo,
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+    );
+    m.position.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+    m.scale.set(1.15, len, 1.15);
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3(vx, vy, vz).normalize();
+    m.quaternion.setFromUnitVectors(up, dir);
+    this.scene.add(m);
+    this.fx.push({ obj: m, life: 0.07, max: 0.07 });
+  }
+
+  // mark where a shot actually hit (impact puff)
+  impact(x: number, y: number, z: number): void {
+    this.bulletSpark(x, y, z);
+    const s = new THREE.Mesh(
+      new THREE.SphereGeometry(2, 5, 4),
+      new THREE.MeshBasicMaterial({ color: 0xffe9b0, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }),
+    );
+    s.position.set(x, y, z);
+    this.scene.add(s);
+    this.fx.push({ obj: s, life: 0.1, max: 0.1, grow: 4 });
   }
 
   updateSmokes(smokes: { x: number; z: number; r: number; till: number }[], now: number): void {

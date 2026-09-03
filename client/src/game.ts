@@ -8,10 +8,33 @@ import type { MatchEvt } from '../../shared/sim.ts';
 import { BTN } from '../../shared/sim.ts';
 import { PLANT_TIME, DEFUSE_TIME } from '../../shared/constants.ts';
 import { PLANT_ZONES } from '../../shared/mapdef.ts';
+import { catOf } from '../../shared/weapons.ts';
 
 const DIGIT_TOOL: Record<string, string> = {
   '1': 'knife', '2': 'pistol', '3': 'primary', '4': 'flash', '5': 'smoke', '6': 'frag', '7': 'fire', '8': 'decoy',
 };
+
+function vmPower(w: string): number {
+  const c = catOf(w);
+  if (c === 'melee') return 0.3;
+  if (c === 'pistol') return 1.0;
+  if (c === 'smg') return 1.1;
+  if (c === 'shotgun') return 2.0;
+  if (c === 'sniper') return 2.3;
+  if (c === 'lmg') return 1.3;
+  return 1.5;
+}
+
+function tracerColor(w: string): number {
+  const c = catOf(w);
+  if (c === 'sniper') return 0xbfe4ff;
+  if (c === 'rifle') return 0x9fd8ff;
+  if (c === 'pistol') return 0xffe3a8;
+  if (c === 'smg') return 0xfff2ad;
+  if (c === 'shotgun') return 0xffb37a;
+  if (c === 'lmg') return 0xffd9a0;
+  return 0xcfe6ff;
+}
 
 export class Game {
   private world: World;
@@ -30,6 +53,8 @@ export class Game {
   private selfId = '';
   private specTarget = '';
   private cam = { x: 0, y: 0, z: 0 };
+  private vmW = '';
+  private vmTeam = -1;
   private vign = 0;
   private lastSb = 0;
   private buy = false;
@@ -195,7 +220,8 @@ export class Game {
     }
 
     const me = this.self();
-    this.camControl(view, me);
+    this.camControl(view, me, dt);
+    this.updateVm(view, me, dt);
 
     this.world.update(dt, view.players, view.selfId);
     this.world.updateSmokes(view.smokes, view.simNow);
@@ -238,13 +264,23 @@ export class Game {
   }
 
   // ---- camera ----------------------------------------------------------------
-  private camControl(view: DriverView, me: PState | undefined): void {
+  private camControl(view: DriverView, me: PState | undefined, dt: number): void {
     if (me && me.alive) {
       this.specTarget = '';
-      const k = 1 - Math.exp(-14 * 0.016);
-      this.cam.x += (me.x - this.cam.x) * k;
-      this.cam.y += (me.y - this.cam.y) * k;
-      this.cam.z += (me.z - this.cam.z) * k;
+      // Extrapolate the newest authoritative snapshot forward by its age using the
+      // snapshot velocity so the own view does not lag a full tick behind input,
+      // then track it with a fast (near-crisp) easing. Snap instantly across large
+      // gaps (spawn/teleport/round reset) so the camera never sweeps the map.
+      const age = Math.max(0, Math.min(view.simAge, 0.06));
+      const tx = me.x + me.vx * age;
+      const ty = me.y;
+      const tz = me.z + me.vz * age;
+      const dx = tx - this.cam.x, dy = ty - this.cam.y, dz = tz - this.cam.z;
+      const dist = Math.hypot(dx, dy, dz);
+      const k = dist > 240 ? 1 : 1 - Math.exp(-55 * Math.min(dt, 0.05));
+      this.cam.x += dx * k;
+      this.cam.y += dy * k;
+      this.cam.z += dz * k;
       this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch, me.duck ? 1 : 0);
       return;
     }
@@ -263,6 +299,24 @@ export class Game {
       this.mouse.pitch += (cur.pitch - this.mouse.pitch) * 0.12;
     }
     this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch, 0);
+  }
+
+  // ---- first-person held weapon ----------------------------------------------
+  private updateVm(view: DriverView, me: PState | undefined, dt: number): void {
+    void view;
+    const w = this.world;
+    if (me && me.alive && me.curW) {
+      if (me.curW !== this.vmW || me.team !== this.vmTeam) {
+        this.vmW = me.curW;
+        this.vmTeam = me.team;
+        w.vmSet(me.curW, me.team);
+      }
+      w.vmShow(true);
+      w.vmUpdate(dt, { speed: Math.hypot(me.vx, me.vz), duck: me.duck === 1, using: me.using === 1 });
+    } else {
+      if (this.vmW) { this.vmW = ''; this.vmTeam = -1; }
+      w.vmShow(false);
+    }
   }
 
   // ---- hud ---------------------------------------------------------------------
@@ -407,8 +461,8 @@ export class Game {
         const x = Number(E.x ?? 0), y = Number(E.y ?? 0), z = Number(E.z ?? 0);
         const w = String(E.w ?? 'knife');
         const big = w === 'obliterator' || w === 'raptor';
-        this.world.muzzle(id, x, y, z, big);
         if (id !== this.selfId) {
+          this.world.muzzle(id, x, y, z, big);
           const me = this.self();
           if (me) {
             const dist = Math.hypot(me.x - x, me.z - z);
@@ -423,10 +477,21 @@ export class Game {
           const me = this.self();
           const w = me?.curW ?? '';
           const m = this.world.gunMouth();
-          this.world.muzzle(this.selfId, m.x, m.y, m.z, w === 'obliterator' || w === 'raptor');
+          this.world.ownMuzzle(m.x, m.y, m.z, w === 'obliterator' || w === 'raptor', vmPower(w));
           this.audio.gunshot(w, 0.5);
         }
         break;
+      case 'tracer': {
+        const id = String(E.id ?? '');
+        const w = String(E.w ?? 'vireo');
+        const x0 = Number(E.x0 ?? 0), y0 = Number(E.y0 ?? 0), z0 = Number(E.z0 ?? 0);
+        const x1 = Number(E.x1 ?? 0), y1 = Number(E.y1 ?? 0), z1 = Number(E.z1 ?? 0);
+        // Own bullets are invisible (no beam leaving the gun); the impact marker
+        // below is the feedback. Everyone else sees the full tracer.
+        if (id !== this.selfId) this.world.tracer(x0, y0, z0, x1, y1, z1, tracerColor(w));
+        this.world.impact(x1, y1, z1);
+        break;
+      }
       case 'reload': if (e.to === this.selfId) this.audio.reload(); break;
       case 'reload_done': if (e.to === this.selfId) this.audio.reloadDone(); break;
       case 'empty': if (e.to === this.selfId) this.audio.dry(); break;

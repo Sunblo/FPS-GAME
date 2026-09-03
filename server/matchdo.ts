@@ -241,7 +241,7 @@ export class MatchDO {
   private broadcast(force: boolean): void {
     if (!this.sim) return;
     const now = Date.now();
-    if (!force && now - this.lastSend < 90) return;
+    if (!force && now - this.lastSend < 33) return;
     this.lastSend = now;
     const sim = this.sim;
     const header = headerOf(sim);

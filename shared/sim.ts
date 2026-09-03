@@ -301,7 +301,7 @@ export class MatchSim {
       const sp = this.shotSpread(wd, p);
       const aY = p.cmd.yaw + (rnd() - 0.5) * 2 * (sp * Math.PI / 180);
       const aP = clamp(p.cmd.pitch + (rnd() - 0.5) * 2 * (sp * Math.PI / 180), -1.55, 1.55);
-      this.fireRay(p, wd, this.fwd3(aY, aP), warmup);
+      this.fireRay(p, wd, this.fwd3(aY, aP), warmup, i);
     }
     this.ev({ k: 'shot', to: p.id, snd: 'shot' });
     if (wd.cat !== 'melee' && wd.cat !== 'lmg' && wd.cat !== 'shotgun') {
@@ -319,7 +319,7 @@ export class MatchSim {
     return Math.min(s, wd.spreadMax + wd.spread);
   }
 
-  private fireRay(p: SimPlayer, wd: any, dir: Vec3, warmup: boolean): void {
+  private fireRay(p: SimPlayer, wd: any, dir: Vec3, warmup: boolean, pellet = 0): void {
     const from: Vec3 = { x: p.x, y: p.y + this.eyeH(p), z: p.z };
     const maxD = wd.rangeMax || 9000;
     const w = rayCollide(from.x, from.y, from.z, dir.x, dir.y, dir.z, maxD);
@@ -355,6 +355,19 @@ export class MatchSim {
         const d = this.raySphere(from, dir, { x: o.x, y: pt.y, z: o.z }, pt.r);
         if (d < bestD) { bestD = d; best = o; bestPart = pt.name; }
       }
+    }
+    // Bullets are invisible: reveal the hit as a tracer + impact only. Emit one
+    // public tracer per trigger pull (first pellet) from near the muzzle to the
+    // first thing the ray touches (wall or enemy), so everyone sees the shot.
+    if (pellet === 0 && wd.cat !== 'melee') {
+      const sx = from.x + dir.x * 22;
+      const sy = from.y - 6 + dir.y * 22;
+      const sz = from.z + dir.z * 22;
+      this.ev({
+        k: 'tracer', id: p.id, w: wd.id,
+        x0: sx, y0: sy, z0: sz,
+        x1: from.x + dir.x * bestD, y1: from.y + dir.y * bestD, z1: from.z + dir.z * bestD,
+      });
     }
     if (!best) return;
     if (warmup) { this.ev({ k: 'hitwarm', to: best.id }); return; }
