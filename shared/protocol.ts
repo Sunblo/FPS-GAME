@@ -14,6 +14,8 @@ export interface CmdInput {
   f: number;
   s: number;
   b: number; // BTN bitmask
+  px?: number; py?: number; pz?: number;
+  pvx?: number; pvy?: number; pvz?: number;
 }
 export interface CmdBuy { t: 'buy'; item: string }
 export interface CmdSlot { t: 'slot'; slot: number }

@@ -16,7 +16,7 @@ import { clamp } from './mathv.ts';
 import type { Vec3 } from './mathv.ts';
 import { WEAPONS, UTILITIES, ARMOR_VEST, ARMOR_HELMET, catOf } from './weapons.ts';
 import { stepPhysics, rayCollide } from './geo.ts';
-import { SPAWNS, plantZoneAt, buyZone, COLLIDERS } from './mapdef.ts';
+import { SPAWNS, plantZoneAt, buyZone, COLLIDERS, COLS, ROWS, CELL } from './mapdef.ts';
 import type { CInput, MatchConfig, Phase, SnapEvt, Team } from './types.ts';
 
 export const BTN = { JUMP: 1, CROUCH: 2, WALK: 4, FIRE: 8, ZOOM: 16, USE: 32 } as const;
@@ -74,10 +74,10 @@ function blank(team: Team): SimPlayer {
     slots: {
       knife: { id: 'knife', mag: 0, res: 0 },
       pistol: { id: 'vireo', mag: WEAPONS.vireo.mag, res: WEAPONS.vireo.reserve },
-      primary: { id: '', mag: 0, res: 0 },
+      primary: { id: 'vanguard', mag: WEAPONS.vanguard.mag, res: WEAPONS.vanguard.reserve },
     },
     util: { flash: 0, frag: 0, smoke: 0, fire: 0, decoy: 0 },
-    curW: 'knife', equipT: 0,
+     curW: 'vanguard', equipT: 0,
     nextFireAt: 0, reloadUntil: 0, reloadAt: 0,
     recoilAmt: 0, lastShotAt: -9,
     hasBomb: false, kills: 0, deaths: 0, lossStreak: 0,
@@ -204,6 +204,27 @@ export class MatchSim {
     p.cmd.f = clamp(c.f, -1, 1);
     p.cmd.s = clamp(c.s, -1, 1);
     p.cmd.b = c.b & 63;
+    if (!p.isBot && c.px !== undefined && c.pz !== undefined) {
+      this.acceptClientMove(p, c);
+    }
+  }
+
+  acceptClientMove(p: SimPlayer, c: CInput): void {
+    if (!p.alive) return;
+    if (this.phase === 'freeze' || this.phase === 'roundend' || this.phase === 'matchover') return;
+    const nx = clamp(c.px ?? p.x, 30, COLS * CELL - 30);
+    const ny = clamp(c.py ?? p.y, 0, 400);
+    const nz = clamp(c.pz ?? p.z, 30, ROWS * CELL - 30);
+    const dx = nx - p.x, dz = nz - p.z, dy = ny - p.y;
+    if (Math.hypot(dx, dz) > 90 || Math.abs(dy) > 80) return;
+    p.x = nx; p.y = ny; p.z = nz;
+    p.vx = clamp(c.pvx ?? p.vx, -420, 420);
+    p.vy = clamp(c.pvy ?? p.vy, -900, 420);
+    p.vz = clamp(c.pvz ?? p.vz, -420, 420);
+    p.duck = (c.b & BTN.CROUCH) !== 0;
+    p.onGround = Math.abs(p.vy) < 28;
+    const spd = Math.hypot(p.vx, p.vz);
+    p.moving = spd > 220 ? 2 : spd > 40 ? 1 : 0;
   }
 
   // helpers ----------------------------------------------------------------------
@@ -230,7 +251,7 @@ export class MatchSim {
     const owned: string[] = ['knife', p.slots.pistol.id];
     if (p.slots.primary.id) owned.push(p.slots.primary.id);
     for (const k of Object.keys(UTILITIES)) if ((p.util[k] ?? 0) > 0) owned.push(k);
-    const target = slot === 0 ? 'knife' : slot === 1 ? p.slots.pistol.id : (owned[slot] ?? p.curW);
+    const target = slot === 0 ? 'knife' : slot === 1 ? p.slots.pistol.id : slot === 2 ? (p.slots.primary.id || p.curW) : (owned[slot] ?? p.curW);
     if (target && target !== p.curW) {
       const t = catOf(target) === 'sniper' ? 1.1 : catOf(target) === 'melee' ? 0.45 : catOf(target) === 'utility' ? 0.6 : 0.75;
       p.curW = target;
@@ -294,7 +315,6 @@ export class MatchSim {
         if (!warmup) slot.mag--;
       }
     }
-    p.recoilAmt = Math.min(p.recoilAmt + wd.spreadPerShot * 1.0, wd.recoilMax);
     p.lastShotAt = this.now;
     const pellets = wd.pellets || 1;
     for (let i = 0; i < pellets; i++) {
@@ -303,6 +323,7 @@ export class MatchSim {
       const aP = clamp(p.cmd.pitch + (rnd() - 0.5) * 2 * (sp * Math.PI / 180), -1.55, 1.55);
       this.fireRay(p, wd, this.fwd3(aY, aP), warmup, i);
     }
+    p.recoilAmt = Math.min(p.recoilAmt + wd.spreadPerShot * 1.0, wd.recoilMax);
     this.ev({ k: 'shot', to: p.id, snd: 'shot' });
     if (wd.cat !== 'melee' && wd.cat !== 'lmg' && wd.cat !== 'shotgun') {
       this.ev({ k: 'muzzle', id: p.id, w, x: p.x, y: p.y + this.eyeH(p), z: p.z, yaw: p.cmd.yaw, pitch: p.cmd.pitch });
@@ -339,7 +360,7 @@ export class MatchSim {
           if (dot > 0.35 && d < bestD) { bestD = d; best = o; bestPart = d > reach * 0.55 ? 'body' : 'head'; }
         }
       }
-      if (best) this.applyDamage(p, best, bestPart === 'head' ? wd.dmg * 1.9 : wd.dmg, bestPart, wd, warmup);
+      if (best) this.applyDamage(p, best, wd.dmg, bestPart, wd, warmup);
       return;
     }
     for (const o of this.players.values()) {
@@ -347,9 +368,9 @@ export class MatchSim {
       if (p.team === o.team) continue;
       const oh = this.eyeH(o);
       const parts = [
-        { y: o.y + oh * 0.93, r: 10, name: 'head' },
-        { y: o.y + oh * 0.5, r: 17, name: 'body' },
-        { y: o.y + 10, r: 13, name: 'limbs' },
+        { y: o.y + oh * 0.97, r: 9, name: 'head' },
+        { y: o.y + oh * 0.66, r: 17, name: 'body' },
+        { y: o.y + oh * 0.25, r: 13, name: 'limbs' },
       ];
       for (const pt of parts) {
         const d = this.raySphere(from, dir, { x: o.x, y: pt.y, z: o.z }, pt.r);
@@ -396,6 +417,7 @@ export class MatchSim {
     if (head) t.hs++;
     src.mvpScore += dmg;
     this.ev({ k: 'dmg', to: t.id, hs: head ? 1 : 0, w: wd.id, from: src.id, amt: dmg });
+    this.ev({ k: 'hit', to: src.id, hs: head ? 1 : 0, amt: dmg, v: t.id });
     if (t.hp <= 0) this.kill(t, src, head, wd.id);
   }
 
@@ -674,13 +696,20 @@ export class MatchSim {
     const s = list[(this.order.indexOf(p.id) % list.length + p.team * 3) % list.length];
     p.x = s.x + (rnd() - 0.5) * 40;
     p.z = s.z + (rnd() - 0.5) * 40;
-    p.x = clamp(p.x, 30, 34 * 64 - 30);
-    p.z = clamp(p.z, 30, 30 * 64 - 30);
+    p.x = clamp(p.x, 30, COLS * CELL - 30);
+    p.z = clamp(p.z, 30, ROWS * CELL - 30);
     p.y = 0;
     p.vx = 0; p.vy = 0; p.vz = 0;
     p.yaw = s.yaw; p.pitch = 0;
     p.cmd.yaw = s.yaw; p.cmd.pitch = 0; p.cmd.f = 0; p.cmd.s = 0; p.cmd.b = 0;
     p.alive = true; p.hp = MAX_HEALTH;
+    if (!p.slots.primary.id) {
+      p.slots.primary = { id: 'vanguard', mag: WEAPONS.vanguard.mag, res: WEAPONS.vanguard.reserve };
+    }
+    if (!p.slots.pistol.id) {
+      p.slots.pistol = { id: 'vireo', mag: WEAPONS.vireo.mag, res: WEAPONS.vireo.reserve };
+    }
+    if (!p.curW) p.curW = p.slots.primary.id;
     p.using = false; p.reloadUntil = 0; p.reloadAt = 0; p.equipT = 0;
     p.recoilAmt = 0; p.throwing = 0;
     p.onGround = false;
@@ -721,7 +750,10 @@ export class MatchSim {
       refill(p.slots.pistol);
       refill(p.slots.primary);
       p.util = { flash: 0, frag: 0, smoke: 0, fire: 0, decoy: 0 };
-      p.curW = 'knife';
+      if (!p.slots.primary.id) {
+        p.slots.primary = { id: 'vanguard', mag: WEAPONS.vanguard.mag, res: WEAPONS.vanguard.reserve };
+      }
+      p.curW = p.slots.primary.id || p.slots.pistol.id || 'knife';
       p.equipT = 0;
       p.hasBomb = false;
       p.hp = MAX_HEALTH;
@@ -945,15 +977,17 @@ export class MatchSim {
       const c = p.cmd;
       // movement
       if (move) {
-        const prev = { x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, onGround: p.onGround, duck: p.duck };
-        const res = stepPhysics(prev, { f: c.f, s: c.s, jump: (c.b & BTN.JUMP) !== 0, walk: (c.b & BTN.WALK) !== 0 }, p.cmd.yaw, dt);
-        p.x = res.body.x; p.y = res.body.y; p.z = res.body.z;
-        p.vx = res.body.vx; p.vy = res.body.vy; p.vz = res.body.vz;
-        p.onGround = res.body.onGround;
+        p.duck = (c.b & BTN.CROUCH) !== 0;
+        if (p.isBot) {
+          const prev = { x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, onGround: p.onGround, duck: p.duck };
+          const res = stepPhysics(prev, { f: c.f, s: c.s, jump: (c.b & BTN.JUMP) !== 0, walk: (c.b & BTN.WALK) !== 0 }, p.cmd.yaw, dt);
+          p.x = res.body.x; p.y = res.body.y; p.z = res.body.z;
+          p.vx = res.body.vx; p.vy = res.body.vy; p.vz = res.body.vz;
+          p.onGround = res.body.onGround;
+          if (res.landed) this.ev({ k: 'land', to: p.id });
+        }
         const spd = Math.hypot(p.vx, p.vz);
-        if (res.landed) this.ev({ k: 'land', to: p.id });
-        const mv = spd > 220 ? 2 : spd > 40 ? 1 : 0;
-        p.moving = mv;
+        p.moving = spd > 220 ? 2 : spd > 40 ? 1 : 0;
         p.walkPhase += spd * dt * 0.05;
       } else {
         p.vx *= 0.8; p.vz *= 0.8; p.vx = 0; p.vz = 0; p.vy = 0;

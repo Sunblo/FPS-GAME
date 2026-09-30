@@ -9,17 +9,19 @@ export const TEAM_ATTACK = 1; // orange "Breach Unit" - plants the device
 export const TEAM_DEFEND = 2; // cyan  "Vault Guard" - defends sites
 export const TEAM_NONE = 0;
 
-// Physics -------------------------------------------------------------------
-export const GRAVITY = 820; // units/s^2
-export const JUMP_VEL = 352; // vertical launch speed (apex ~75.5u)
-export const MAX_SPEED = 252; // units/s ground
-export const WALK_FACTOR = 0.5;
-export const CROUCH_FACTOR = 0.36;
+// Physics (CS2 / Source-style) ----------------------------------------------
+export const GRAVITY = 800;
+export const JUMP_VEL = 301;
+export const MAX_SPEED = 250;
+export const WALK_FACTOR = 0.52;
+export const CROUCH_FACTOR = 0.34;
 export const AIR_FACTOR = 1.0;
-export const ACCEL = 2400; // ground accel (u/s^2)
-export const AIR_ACCEL = 1300;
-export const FRICTION = 4.4; // stopping coefficient (higher = stop faster)
-export const STEP_HEIGHT = 18; // max walkable ledge/step
+export const ACCEL = 5.5;
+export const AIR_ACCEL = 12;
+export const AIR_MAX_WISH = 30;
+export const FRICTION = 5.2;
+export const STOP_SPEED = 80;
+export const STEP_HEIGHT = 18;
 export const PLAYER_RADIUS = 16; // XZ half-extent
 export const STAND_HEIGHT = 72;
 export const CROUCH_HEIGHT = 54;
@@ -35,7 +37,7 @@ export const PRED_TICK = 30; // client-side logical prediction cadence
 export const MAX_HEALTH = 100;
 export const MAX_ARMOR = 100;
 export const ARMOR_DMG_ABSORB = 0.5; // fraction of non-penetrating damage armor eats
-export const HEADSHOT_MULT = 4;
+export const HEADSHOT_MULT = 2.5;
 export const LIMB_MULT = 0.72; // legs/feet
 export const BOMB_ARM_TIME = 45; // seconds after plant to detonate
 export const PLANT_TIME = 3.2;

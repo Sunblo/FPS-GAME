@@ -33,4 +33,4 @@ function bfs(c0: number, r0: number): number {
   return seen.size;
 }
 const totalFloor = floorCells.reduce((a, b) => a + b, 0);
-console.log('floor cells:', totalFloor, 'from atk spawn reachable:', bfs(16, 2), 'from siteA', bfs(27, 17), 'from siteB', bfs(5, 17));
+console.log('floor cells:', totalFloor, 'from atk spawn reachable:', bfs(23, 3), 'from siteA', bfs(39, 22), 'from siteB', bfs(8, 22));

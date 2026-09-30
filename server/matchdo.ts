@@ -149,13 +149,19 @@ export class MatchDO {
 
     this.ttl = Date.now() + 120_000;
     switch (msg.t) {
-      case 'input':
-        p.cmd.yaw = clamp(msg.yaw, -Math.PI * 4, Math.PI * 4);
-        p.cmd.pitch = clamp(msg.pitch, -1.553, 1.553);
-        p.cmd.f = clamp(msg.f, -1, 1);
-        p.cmd.s = clamp(msg.s, -1, 1);
-        p.cmd.b = msg.b & 63;
+      case 'input': {
+        const m = msg as { yaw: number; pitch: number; f: number; s: number; b: number; px?: number; py?: number; pz?: number; pvx?: number; pvy?: number; pvz?: number };
+        p.cmd.yaw = clamp(m.yaw, -Math.PI * 4, Math.PI * 4);
+        p.cmd.pitch = clamp(m.pitch, -1.553, 1.553);
+        p.cmd.f = clamp(m.f, -1, 1);
+        p.cmd.s = clamp(m.s, -1, 1);
+        p.cmd.b = m.b & 63;
+        this.sim.acceptClientMove(p, {
+          seq: 0, yaw: p.cmd.yaw, pitch: p.cmd.pitch, f: p.cmd.f, s: p.cmd.s, b: p.cmd.b,
+          px: m.px, py: m.py, pz: m.pz, pvx: m.pvx, pvy: m.pvy, pvz: m.pvz,
+        });
         break;
+      }
       case 'buy':
         if (this.sim) this.sim.buyItem(p, sanitizeItem(msg.item));
         break;
@@ -304,9 +310,8 @@ function clampI(v: string | null, lo: number, hi: number, d: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
 const ITEMS = new Set(['armor', 'helmet', 'frag', 'smoke', 'flash', 'fire', 'decoy',
-  'leviathan', 'vanguard', 'sentinel', 'skitter', 'marauder', 'breacher',
-  'pax', 'mirage', 'shadow', 'talisman', 'verge', 'nova-x', 'obliterator',
-  'raptor', 'viper', 'hydra', 'gauss-p', 'atlas-p', 'ranger-p', 'cyclone-p']);
+  'knife', 'vireo', 'warden', 'talon', 'marauder', 'skitter', 'breacher',
+  'vanguard', 'sentinel', 'sparrow', 'leviathan', 'bulwark']);
 function sanitizeItem(s: string): string {
   return ITEMS.has(s) ? s : '';
 }

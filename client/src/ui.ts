@@ -2,13 +2,11 @@
 import { WEAPONS, UTILITIES } from '../../shared/weapons.ts';
 import type { SnapHeader } from '../../shared/protocol.ts';
 import type { PState } from '../../shared/protocol.ts';
-import { floorCells, COLS, ROWS, CELL } from '../../shared/mapdef.ts';
+import { floorCells, COLS, ROWS, CELL, PLANT_ZONES } from '../../shared/mapdef.ts';
 
 export interface MenuStartArgs {
-  mode: 'practice' | 'online';
   name: string;
   teamSize: number;
-  skill: number;
   code: string;
 }
 
@@ -28,7 +26,6 @@ export class Menu {
   private nameI: HTMLInputElement;
   private codeI: HTMLInputElement;
   private sizeSel: HTMLSelectElement;
-  private skillSel: HTMLSelectElement;
   private err: HTMLElement;
 
   constructor(parent: HTMLElement) {
@@ -38,20 +35,19 @@ export class Menu {
     this.nameI = this.root.querySelector('#mname') as HTMLInputElement;
     this.codeI = this.root.querySelector('#mcode') as HTMLInputElement;
     this.sizeSel = this.root.querySelector('#msize') as HTMLSelectElement;
-    this.skillSel = this.root.querySelector('#mskill') as HTMLSelectElement;
     this.err = this.root.querySelector('#err') as HTMLElement;
     const saved = localStorage.getItem('as.name');
     if (saved) this.nameI.value = saved;
-    this.root.querySelector('#start')!.addEventListener('click', () => this.go('online'));
-    this.root.querySelector('#practice')!.addEventListener('click', () => this.go('practice'));
+    this.root.querySelector('#start')!.addEventListener('click', () => this.go());
   }
 
   private render(): void {
     this.root.id = 'menu';
     this.root.innerHTML = `
       <div class="card">
+        <div class="brand">REACTOR-09</div>
         <h1>AXIOM<span> SIEGE</span></h1>
-        <div class="tag">ORIGINAL TACTICAL CORE · 5V5 · REACTOR-09</div>
+        <div class="tag">ORIGINAL TACTICAL CORE · BOMB / DEFUSE · 5V5</div>
         <label class="fld">CALLSIGN
           <input id="mname" class="txt" maxlength="18" placeholder="HOSTILE" autocomplete="off" />
         </label>
@@ -63,41 +59,32 @@ export class Menu {
             <option value="5" selected>5v5</option>
           </select>
         </label>
-        <label class="fld">BOT DIFFICULTY
-          <select id="mskill" class="txt">
-            <option value="0.35">Recruit</option>
-            <option value="0.6" selected>Veteran</option>
-            <option value="0.95">RIG-EX</option>
-          </select>
-        </label>
-        <label class="fld">ROOM CODE (ONLINE)
+        <label class="fld">ROOM CODE
           <input id="mcode" class="txt" maxlength="8" placeholder="make one up, share it" autocomplete="off" />
         </label>
         <div class="row">
-          <button id="practice" class="btn primary">TRAINING vs BOTS</button>
-          <button id="start" class="btn ghost">ONLINE</button>
+          <button id="start" class="btn primary">JOIN MATCH</button>
         </div>
         <div id="err"></div>
         <div class="sub">
           <kbd>WASD</kbd> move · <kbd>MOUSE</kbd> look · <kbd>LMB</kbd> fire · <kbd>RMB</kbd> zoom ·
-          <kbd>R</kbd> reload · <kbd>E</kbd> plant/defuse · <kbd>B</kbd> buy · <kbd>1-4</kbd> weapons ·
+          <kbd>R</kbd> reload · <kbd>E</kbd> plant/defuse · <kbd>B</kbd> buy · <kbd>1</kbd> rifle · <kbd>2</kbd> pistol · <kbd>3</kbd> knife ·
           <kbd>SHIFT</kbd> walk · <kbd>CTRL</kbd> crouch · <kbd>SPACE</kbd> jump · <kbd>TAB</kbd> score
         </div>
       </div>`;
   }
 
-  private go(mode: 'practice' | 'online'): void {
+  private go(): void {
     const name = this.nameI.value.trim().slice(0, 18) || 'HOSTILE';
     localStorage.setItem('as.name', name);
     const teamSize = parseInt(this.sizeSel.value, 10) || 5;
-    const skill = parseFloat(this.skillSel.value) || 0.6;
     const code = this.codeI.value.trim().toLowerCase();
-    if (mode === 'online' && code.length < 3) {
+    if (code.length < 3) {
       this.err.textContent = 'Room code needs at least 3 characters.';
       return;
     }
     this.err.textContent = '';
-    this.onStart({ mode, name, teamSize, skill, code });
+    this.onStart({ name, teamSize, code });
   }
 
   show(): void { this.root.classList.remove('hidden'); }
@@ -123,6 +110,8 @@ export interface Hud {
   setSbOpen(v: boolean): void;
   setConnState(s: string): void;
   debug(text: string): void;
+  scope(on: boolean): void;
+  setHint(text: string): void;
 }
 
 export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
@@ -140,16 +129,17 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
       <div id="money">$0</div>
       <div id="weaponname"></div>
       <div id="ammo"></div>
-      <div id="armorbar"><i></i></div>
-      <div id="hpbar"><i></i></div>
+      <div id="hpwrap"><span id="hpnum">100</span><div id="hpbar"><i></i></div></div>
+      <div id="arwrap"><span id="arnum">0</span><div id="armorbar"><i></i></div></div>
       <div id="bombflag" class="hidden"></div>
     </div>
     <div class="el" id="center">
       <div id="banner"></div>
+      <div id="hint" class="hidden"></div>
       <div id="plantmsg" class="hidden"></div>
       <div id="progwrap" class="hidden"><div id="prog"></div></div>
     </div>
-    <div class="el" id="radar"><canvas width="150" height="150"></canvas><div class="lbl">RADAR</div></div>
+    <div class="el" id="radar"><canvas width="160" height="160"></canvas><div class="lbl">RADAR</div></div>
     <div class="el" id="xh"><i class="t"></i><i class="b"></i><i class="l"></i><i class="r"></i><i class="ct"></i></div>
     <div class="el" id="vign"></div>
     <div class="el" id="screenflash"></div>
@@ -157,13 +147,13 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
     <div class="el hidden" id="debug"></div>
     <div class="el hidden" id="buypanel"><div class="box" id="buybox"></div></div>
     <div class="el hidden" id="scoreboard"><div class="box" id="sbbox"></div></div>
-    <div class="el" id="roundcard"><div class="inner"><div class="r"></div><div class="w"></div></div></div>
+    <div class="el hidden" id="roundcard"><div class="inner"><div class="r"></div><div class="w"></div></div></div>
     <div class="el hidden" id="toast"></div>
   `;
   const $ = (id: string): HTMLElement => root.querySelector('#' + id)!;
   const ids: Record<string, HTMLElement> = {};
   for (const id of ['topbar', 'score', 'roundinfo', 'roundtimer', 'kfeed', 'statL', 'money',
-    'weaponname', 'ammo', 'armorbar', 'hpbar', 'bombflag', 'center', 'banner', 'plantmsg',
+    'weaponname', 'ammo', 'armorbar', 'hpbar', 'hpnum', 'arnum', 'bombflag', 'center', 'banner', 'hint', 'plantmsg',
     'progwrap', 'prog', 'radar', 'xh', 'vign', 'screenflash', 'pointer', 'debug',
     'buypanel', 'buybox', 'scoreboard', 'sbbox', 'roundcard', 'toast']) ids[id] = $(id);
 
@@ -176,21 +166,26 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
     hide() { root.classList.remove('show'); },
     setMoney(m) { ids.money.textContent = '$' + m; },
     setWeapon(name, mag, res) {
-      const nm = name || 'knife';
-      ids.weaponname.textContent = nm.toUpperCase();
+      const w = WEAPONS[name];
+      const u = UTILITIES[name];
+      ids.weaponname.textContent = (w?.name || u?.name || name || 'knife').toUpperCase();
       if (mag >= 0) {
-        ids.ammo.textContent = `${mag} <small>/ ${res >= 0 ? res : '-'}</small>`;
+        ids.ammo.innerHTML = `${mag} <small>/ ${res >= 0 ? res : '-'}</small>`;
       } else {
-        ids.ammo.textContent = '';
+        ids.ammo.textContent = w?.cat === 'melee' || !name ? '—' : '';
       }
     },
     setBars(hp, armor) {
       const h = Math.max(0, hp) / 100;
       ids.hpbar.querySelector('i')!.style.width = (h * 100) + '%';
-      ids.armorbar.querySelector('i')!.style.width = (armor / 100 * 100) + '%';
+      ids.armorbar.querySelector('i')!.style.width = (Math.max(0, armor) / 100 * 100) + '%';
+      ids.hpnum.textContent = String(Math.max(0, Math.round(hp)));
+      ids.hpnum.style.color = hp <= 25 ? 'var(--danger)' : 'var(--muted)';
+      ids.arnum.textContent = String(Math.max(0, Math.round(armor)));
       ids.hpbar.style.visibility = 'visible';
-      if (armor <= 0) ids.armorbar.style.visibility = 'hidden';
-      else ids.armorbar.style.visibility = 'visible';
+      (ids.hpbar.parentElement as HTMLElement).style.visibility = 'visible';
+      const arWrap = ids.armorbar.parentElement as HTMLElement;
+      arWrap.style.visibility = armor <= 0 ? 'hidden' : 'visible';
     },
     setBomb(has) { ids.bombflag.classList.toggle('hidden', !has); ids.bombflag.textContent = 'C4 SECURED'; },
     setHeader(h, winnerTeam) {
@@ -214,7 +209,8 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
     },
     killfeed(k) {
       const row = el('div', 'k');
-      row.innerHTML = `<b>${esc(k.kn)}</b> <span class="w">[${k.w.toUpperCase()}${k.hs ? ' (HEAD)' : ''}]</span> <b>${esc(k.vn)}</b>`;
+      const wname = (WEAPONS[k.w]?.name || UTILITIES[k.w]?.name || k.w).toUpperCase();
+      row.innerHTML = `<b>${esc(k.kn)}</b> <span class="w">[${wname}${k.hs ? ' · HS' : ''}]</span> <b>${esc(k.vn)}</b>`;
       ids.kfeed.appendChild(row);
       while (ids.kfeed.children.length > 6) ids.kfeed.removeChild(ids.kfeed.firstChild!);
       setTimeout(() => row.remove(), 6000);
@@ -255,6 +251,8 @@ export function buildHud(parent: HTMLElement): { hud: Hud; root: HTMLElement } {
     setSbOpen(v) { ids.scoreboard.classList.toggle('hidden', !v); },
     setConnState(s) { ids.pointer.textContent = s; },
     debug(text) { ids.debug.textContent = text; ids.debug.classList.remove('hidden'); },
+    scope(on) { ids.xh.classList.toggle('scoped', on); },
+    setHint(text) { ids.hint.textContent = text; ids.hint.classList.toggle('hidden', !text); },
   };
   return { hud, root };
 }
@@ -286,48 +284,71 @@ export class Radar {
   }
   draw(players: PState[], me: PState | undefined, header: SnapHeader): void {
     const ctx = this.ctx;
-    const S = 150;
+    const S = this.canvas.width;
     ctx.clearRect(0, 0, S, S);
-    const scale = S / Math.max(COLS, ROWS);
     ctx.save();
-    // background map silhouette (floor cells)
-    ctx.globalAlpha = 0.35;
-    ctx.fillStyle = '#06090e';
+    ctx.beginPath();
+    ctx.arc(S / 2, S / 2, S / 2 - 1, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = '#070b12';
     ctx.fillRect(0, 0, S, S);
-    ctx.fillStyle = '#1c2a3a';
+
+    const range = 920;
+    const scale = (S * 0.46) / range;
+    const ox = me ? me.x : (COLS * CELL) / 2;
+    const oz = me ? me.z : (ROWS * CELL) / 2;
+    ctx.translate(S / 2, S / 2);
+    if (me) ctx.rotate(-me.yaw);
+
+    ctx.fillStyle = '#1a2736';
+    const cellPx = CELL * scale;
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        if (floorCells[r * COLS + c]) ctx.fillRect(c * CELL * scale, r * CELL * scale, CELL * scale, CELL * scale);
+        if (!floorCells[r * COLS + c]) continue;
+        const x = ((c + 0.5) * CELL - ox) * scale;
+        const y = ((r + 0.5) * CELL - oz) * scale;
+        ctx.fillRect(x - cellPx / 2, y - cellPx / 2, cellPx + 0.4, cellPx + 0.4);
       }
     }
-    ctx.globalAlpha = 1;
-    // rotate so "up" is facing
-    if (me) {
-      ctx.translate(S / 2, S / 2);
-      ctx.rotate(-me.yaw);
-      ctx.translate(-S / 2, -S / 2);
+
+    for (const z of PLANT_ZONES) {
+      const x = (z.x - ox) * scale, y = (z.z - oz) * scale;
+      ctx.strokeStyle = header.plant === z.site ? '#ff5d5d' : '#ffd166';
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(x, y, 7, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = header.plant === z.site ? '#ff5d5d' : '#ffd166';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(z.site === 1 ? 'A' : 'B', x, y);
+      ctx.globalAlpha = 1;
     }
+
     for (const p of players) {
       if (!p.alive) continue;
-      const x = p.x * scale, y = p.z * scale;
-      if (x < -6 || y < -6 || x > S + 6 || y > S + 6) continue;
-      const col = p.team === 2 ? '#54b8ff' : p.team === 1 ? '#ff8a4c' : '#777';
-      const isMe = me && p.id === me.id;
-      ctx.fillStyle = col;
+      const x = (p.x - ox) * scale, y = (p.z - oz) * scale;
+      if (x * x + y * y > (S / 2) * (S / 2)) continue;
+      const isMe = !!(me && p.id === me.id);
+      const ally = me ? p.team === me.team : true;
+      ctx.fillStyle = isMe ? '#e8f0ff' : ally ? (p.team === 2 ? '#54b8ff' : '#ff8a4c') : (p.team === 2 ? '#54b8ff' : '#ff8a4c');
       ctx.beginPath();
-      ctx.arc(x, y, isMe ? 4 : 3, 0, Math.PI * 2);
+      ctx.arc(x, y, isMe ? 4.2 : 3.1, 0, Math.PI * 2);
       ctx.fill();
-      if (p.hasBomb) { ctx.strokeStyle = '#ffd166'; ctx.strokeRect(x - 5, y - 5, 10, 10); }
-    }
-    if (me) {
-      const x = me.x * scale, y = me.z * scale;
-      ctx.strokeStyle = '#fff';
-      ctx.beginPath();
-      ctx.arc(x, y, 5, 0, Math.PI * 2);
-      ctx.stroke();
+      if (p.hasBomb) {
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x - 5, y - 5, 10, 10);
+      }
     }
     ctx.restore();
-    void header;
+    ctx.strokeStyle = 'rgba(140,170,210,0.35)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(S / 2, S / 2, S / 2 - 1.5, 0, Math.PI * 2);
+    ctx.stroke();
   }
 }
 
@@ -360,12 +381,14 @@ export function buildBuyPanel(panel: HTMLElement, me: PState | undefined, cb: Bu
         const w = WEAPONS[id];
         const u = UTILITIES[id];
         const price = w ? w.price : u ? u.price : id === 'armor' ? 650 : 1000;
-        const owned = me && id === 'armor' && me.armor >= 100;
-        const btn = el('button', 'item');
-        btn.innerHTML = `<div class="nm">${id}</div><div class="st">${stat(id, w, u)}</div><div class="pr">$${price}</div>`;
-        btn.addEventListener('click', () => cb.onBuy(id));
+        const owned = !!(me && id === 'armor' && me.armor >= 100);
+        const poor = !!(me && me.money < price);
+        const btn = el<HTMLButtonElement>('button', 'item' + (owned ? ' owned' : '') + (poor ? ' poor' : ''));
+        const nm = w ? w.name : u ? u.name : id === 'armor' ? 'Kevlar Vest' : id === 'helmet' ? 'Helmet Kit' : id;
+        btn.innerHTML = `<div class="cat">${w ? w.cat : (u ? 'util' : 'gear')}</div><div class="nm">${nm}</div><div class="st">${stat(id, w, u)}</div><div class="pr">$${price}</div>`;
+        btn.disabled = poor || owned;
+        btn.addEventListener('click', () => { if (!btn.disabled) cb.onBuy(id); });
         grid.appendChild(btn);
-        void owned;
       }
     }
   };

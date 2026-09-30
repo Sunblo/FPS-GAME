@@ -4,8 +4,9 @@
 import { MatchSim } from '../../../shared/sim.ts';
 import { BotBrain, botNames } from '../../../shared/bot.ts';
 import { headerOf, snapBodyOf, type SnapHeader, type PState, type SmokeInfo, type FireInfo } from '../../../shared/protocol.ts';
-import type { MatchEvt } from '../../../shared/sim.ts';
+import { BTN, type MatchEvt } from '../../../shared/sim.ts';
 import type { CInput } from '../../../shared/types.ts';
+import { stepPhysics, type PhysBody } from '../../../shared/geo.ts';
 
 export interface DriverView {
   header: SnapHeader;
@@ -140,17 +141,32 @@ export class OnlineGame extends GameDriver {
   private evQ: MatchEvt[] = [];
   private snapAtMs = 0;
   private readyResolve: (() => void) | null = null;
+  private readyReject: ((e: Error) => void) | null = null;
   ready: Promise<void>;
   joined = false;
   private closed = false;
+  private pred: PhysBody | null = null;
+  private lastCmd: CInput | null = null;
+  private predAlive = false;
+  private canMove = true;
+  private seq = 0;
 
   constructor(opts: OnlineOpts) {
     super();
     this.ws = new WebSocket(`${opts.url}?code=${encodeURIComponent(opts.code)}&name=${encodeURIComponent(opts.name)}&id=${Math.random().toString(36).slice(2)}&size=${opts.teamSize}`);
-    this.ready = new Promise((res) => { this.readyResolve = res; });
+    this.ready = new Promise((res, rej) => {
+      this.readyResolve = res;
+      this.readyReject = rej;
+    });
     this.ws.onmessage = (ev: MessageEvent) => this.handle(ev);
-    this.ws.onclose = () => { this.closed = true; };
-    this.ws.onerror = () => { this.closed = true; };
+    this.ws.onclose = () => {
+      this.closed = true;
+      if (!this.joined && this.readyReject) { this.readyReject(new Error('closed')); this.readyReject = null; this.readyResolve = null; }
+    };
+    this.ws.onerror = () => {
+      this.closed = true;
+      if (!this.joined && this.readyReject) { this.readyReject(new Error('ws')); this.readyReject = null; this.readyResolve = null; }
+    };
   }
 
   private handle(ev: MessageEvent): void {
@@ -164,15 +180,16 @@ export class OnlineGame extends GameDriver {
       this._view.selfId = j.id;
       this._view.header = j.header;
       this.joined = true;
-      if (this.readyResolve) { this.readyResolve(); this.readyResolve = null; }
+      if (this.readyResolve) { this.readyResolve(); this.readyResolve = null; this.readyReject = null; }
     } else if (msg.t === 'snap') {
       const s = msg as unknown as { header: SnapHeader; players: PState[]; smokes: SmokeInfo[]; fires: FireInfo[]; events: MatchEvt[] };
       this._view.header = s.header;
       this._view.players = s.players;
       this._view.smokes = s.smokes;
       this._view.fires = s.fires;
-      this._view.simNow = Date.now() / 1000; // best-effort sim clock alignment
+      this._view.simNow = Date.now() / 1000;
       this.snapAtMs = Date.now();
+      this.applySnap(s.players, s.header.ph);
       for (const e of s.events) this.evQ.push(e);
     } else if (msg.t === 'kicked') {
       this.closed = true;
@@ -185,7 +202,64 @@ export class OnlineGame extends GameDriver {
     }
     return this._view;
   }
-  step(): void { /* receive-driven */ }
+  step(dt: number): void {
+    if (this.pred && this.predAlive && this.lastCmd && this.canMove) {
+      this.pred.duck = (this.lastCmd.b & BTN.CROUCH) !== 0;
+      const res = stepPhysics(
+        this.pred,
+        {
+          f: this.lastCmd.f,
+          s: this.lastCmd.s,
+          jump: (this.lastCmd.b & BTN.JUMP) !== 0,
+          walk: (this.lastCmd.b & BTN.WALK) !== 0,
+        },
+        this.lastCmd.yaw,
+        Math.min(dt, 0.05),
+      );
+      this.pred = res.body;
+      this.writePred();
+    }
+    this.sendMove();
+  }
+
+  private applySnap(players: PState[], ph: string): void {
+    this.canMove = ph === 'warmup' || ph === 'live';
+    const me = players.find((p) => p.id === this.selfId);
+    if (!me || !me.alive) {
+      this.pred = null;
+      this.predAlive = false;
+      return;
+    }
+    const tele = !this.pred || !this.predAlive
+      || Math.hypot((this.pred.x - me.x), (this.pred.z - me.z)) > 220
+      || Math.abs(this.pred.y - me.y) > 90;
+    if (tele) {
+      this.pred = {
+        x: me.x, y: me.y, z: me.z,
+        vx: 0, vy: 0, vz: 0,
+        onGround: true,
+        duck: me.duck === 1,
+      };
+    }
+    this.predAlive = true;
+    this.writePred();
+  }
+
+  private writePred(): void {
+    if (!this.pred) return;
+    const me = this._view.players.find((p) => p.id === this.selfId);
+    if (!me) return;
+    me.x = this.pred.x;
+    me.y = this.pred.y;
+    me.z = this.pred.z;
+    me.vx = this.pred.vx;
+    me.vy = this.pred.vy;
+    me.vz = this.pred.vz;
+    me.duck = this.pred.duck ? 1 : 0;
+    const spd = Math.hypot(this.pred.vx, this.pred.vz);
+    me.moving = spd > 220 ? 2 : spd > 40 ? 1 : 0;
+  }
+
   events(): MatchEvt[] {
     if (this.evQ.length === 0) return [];
     const out = this.evQ;
@@ -193,9 +267,19 @@ export class OnlineGame extends GameDriver {
     return out;
   }
   setInput(c: CInput): void {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ t: 'input', yaw: c.yaw, pitch: c.pitch, f: c.f, s: c.s, b: c.b }));
-    }
+    this.seq += 1;
+    this.lastCmd = { ...c, seq: this.seq };
+  }
+
+  private sendMove(): void {
+    if (this.ws.readyState !== WebSocket.OPEN || !this.lastCmd) return;
+    const c = this.lastCmd;
+    const body = this.pred;
+    this.ws.send(JSON.stringify({
+      t: 'input', seq: c.seq, yaw: c.yaw, pitch: c.pitch, f: c.f, s: c.s, b: c.b,
+      px: body?.x, py: body?.y, pz: body?.z,
+      pvx: body?.vx, pvy: body?.vy, pvz: body?.vz,
+    }));
   }
   action(a: { t: 'buy' | 'slot' | 'reload' | 'weapon'; item?: string; slot?: number; id?: string }): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;

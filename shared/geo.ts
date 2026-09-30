@@ -1,11 +1,11 @@
 // Shared movement + collision (runs identically on server, in the browser for
 // practice mode, and client-side for prediction). Geometry is a set of AABB
 // colliders; the player is modelled as an AABB (radius x radius x height).
-import { COLLIDERS } from './mapdef.ts';
+import { COLLIDERS, COLS, ROWS, CELL } from './mapdef.ts';
 import type { Box3 } from './types.ts';
 import {
   GRAVITY, JUMP_VEL, MAX_SPEED, WALK_FACTOR, CROUCH_FACTOR, ACCEL, AIR_ACCEL,
-  FRICTION, STEP_HEIGHT, PLAYER_RADIUS,
+  AIR_MAX_WISH, FRICTION, STOP_SPEED, STEP_HEIGHT, PLAYER_RADIUS,
 } from './constants.ts';
 import { clamp as clampV } from './mathv.ts';
 
@@ -103,6 +103,37 @@ export function canJump(b: PhysBody): boolean {
   return b.onGround;
 }
 
+function applyFriction(b: PhysBody, dt: number): void {
+  const speed = Math.hypot(b.vx, b.vz);
+  if (speed < 0.5) { b.vx = 0; b.vz = 0; return; }
+  const control = speed < STOP_SPEED ? STOP_SPEED : speed;
+  const drop = control * FRICTION * dt;
+  const k = Math.max(0, speed - drop) / speed;
+  b.vx *= k;
+  b.vz *= k;
+}
+
+function accelerate(b: PhysBody, wishX: number, wishZ: number, wishSpd: number, accel: number, dt: number): void {
+  if (wishSpd <= 0) return;
+  const current = b.vx * wishX + b.vz * wishZ;
+  const add = wishSpd - current;
+  if (add <= 0) return;
+  const acc = Math.min(add, accel * wishSpd * dt);
+  b.vx += acc * wishX;
+  b.vz += acc * wishZ;
+}
+
+function airAccelerate(b: PhysBody, wishX: number, wishZ: number, wishSpd: number, dt: number): void {
+  if (wishSpd <= 0) return;
+  const wish = Math.min(wishSpd, AIR_MAX_WISH);
+  const current = b.vx * wishX + b.vz * wishZ;
+  const add = wish - current;
+  if (add <= 0) return;
+  const acc = Math.min(add, AIR_ACCEL * wishSpd * dt);
+  b.vx += acc * wishX;
+  b.vz += acc * wishZ;
+}
+
 export interface StepResult { body: PhysBody; jumped: boolean; landed: boolean }
 
 export function stepPhysics(prev: PhysBody, intent: MoveIntent, yaw: number, dt: number): StepResult {
@@ -142,36 +173,16 @@ export function stepPhysics(prev: PhysBody, intent: MoveIntent, yaw: number, dt:
   else if (intent.walk) maxSpeed *= WALK_FACTOR;
 
   const grounded = b.onGround;
+  const wishX = hasWish ? wx : 0;
+  const wishZ = hasWish ? wz : 0;
+  const wishSpd = hasWish ? maxSpeed : 0;
+  const jumping = intent.jump && grounded;
 
-  // horizontal acceleration
-  if (grounded) {
-    const accel = ACCEL;
-    let tgtX = wx * maxSpeed, tgtZ = wz * maxSpeed;
-    if (!hasWish) { tgtX = 0; tgtZ = 0; }
-    const ax = clampV(tgtX - b.vx, -accel * dt, accel * dt);
-    const az = clampV(tgtZ - b.vz, -accel * dt, accel * dt);
-    b.vx += ax; b.vz += az;
-    if (!hasWish) {
-      // friction: decay toward zero
-      const fr = Math.max(0, 1 - FRICTION * dt);
-      b.vx *= fr; b.vz *= fr;
-      if (Math.abs(b.vx) < 0.5) b.vx = 0;
-      if (Math.abs(b.vz) < 0.5) b.vz = 0;
-    }
-    // speed clamp
-    const sp = Math.hypot(b.vx, b.vz);
-    if (sp > maxSpeed) { const k = maxSpeed / sp; b.vx *= k; b.vz *= k; }
-  } else {
-    const accel = AIR_ACCEL;
-    const ax = clampV(wx * maxSpeed * 1.05 - b.vx, -accel * dt, accel * dt);
-    const az = clampV(wz * maxSpeed * 1.05 - b.vz, -accel * dt, accel * dt);
-    b.vx += ax; b.vz += az;
-    const sp = Math.hypot(b.vx, b.vz);
-    const airCap = maxSpeed * 1.3;
-    if (sp > airCap) { const k = airCap / sp; b.vx *= k; b.vz *= k; }
-  }
+  if (grounded && !jumping) applyFriction(b, dt);
+  if (grounded) accelerate(b, wishX, wishZ, wishSpd, ACCEL, dt);
+  else airAccelerate(b, wishX, wishZ, wishSpd, dt);
 
-  if (intent.jump && grounded) {
+  if (jumping) {
     b.vy = JUMP_VEL;
     b.onGround = false;
     jumped = true;
@@ -213,8 +224,8 @@ export function stepPhysics(prev: PhysBody, intent: MoveIntent, yaw: number, dt:
 
   // world clamp
   const M = 0;
-  b.x = clampV(b.x, M + RAD, 34 * 64 - RAD);
-  b.z = clampV(b.z, M + RAD, 30 * 64 - RAD);
+  b.x = clampV(b.x, M + RAD, COLS * CELL - RAD);
+  b.z = clampV(b.z, M + RAD, ROWS * CELL - RAD);
 
   return { body: b, jumped, landed };
 }

@@ -1,16 +1,20 @@
-// Three.js scene for AXIOM SIEGE. Renders the REACTOR-09 geometry from
-// shared/mapdef.ts (rebuilt for looks: merged industrial walls, textured
-// ground, crates/barrels, site decals, sky dome, accent lighting) plus skinned
-// rigged soldiers, smokes, fires and transient effects. Camera/aim is owned by
-// the game loop; this module only draws.
+// Three.js scene for AXIOM SIEGE. Renders REACTOR-09 as a Dust II-inspired
+// desert town (plaster facades, dusty streets, distant hills) plus skinned
+// soldiers, smokes, fires and transient effects. Camera/aim is owned by the
+// game loop; this module only draws.
 import * as THREE from 'three';
+import { Sky } from 'three/examples/jsm/objects/Sky.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import {
-  COLLIDERS, CRATE_BOXES, CRATES, PLANT_ZONES, CELL, COLS, ROWS, WALL_H,
-  floorCells, cellSolid, SPAWNS,
+  COLLIDERS, PLANT_ZONES, CELL, COLS, ROWS, SPAWNS,
 } from '../../shared/mapdef.ts';
 import type { PState } from '../../shared/protocol.ts';
 import { makeCharacter, type CharRig } from './models.ts';
 import { buildViewModel, type VmHandle } from './vmodel.ts';
+import { fitWeapon, getAssets, loadAssets, weaponYaw } from './assets.ts';
 
 interface PlayerDraw {
   group: THREE.Group;
@@ -21,6 +25,7 @@ interface PlayerDraw {
   recoil: number;
   visible: boolean;
   alive: number;
+  wpn: string;
 }
 
 const EYE = 64;
@@ -42,18 +47,27 @@ export class World {
   private vm: VmHandle;
   private tGeo: THREE.CylinderGeometry | null = null;
   private rnd = Math.random;
+  private composer: EffectComposer;
+  private bloom: UnrealBloomPass;
+  private sun: THREE.DirectionalLight | null = null;
+  private texCache = new Map<string, THREE.Texture>();
 
   constructor(container: HTMLElement) {
     this.container = container;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 1.06;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(this.renderer.domElement);
 
-    this.camera = new THREE.PerspectiveCamera(78, container.clientWidth / container.clientHeight, 4, 6000);
+    this.camera = new THREE.PerspectiveCamera(78, container.clientWidth / container.clientHeight, 2, 16000);
     this.camera.rotation.order = 'YXZ';
+    this.scene.background = new THREE.Color(0x8aa7c4);
+    this.scene.fog = new THREE.Fog(0xc4b896, 2600, 11000);
     this.scene.add(this.camera);
 
     this.vm = buildViewModel();
@@ -62,48 +76,167 @@ export class World {
 
     this.buildSky();
     this.buildLights();
-    this.buildMap();
     this.scene.add(this.actorRoot);
     this.smokeTex = this.makeSoftTex();
 
+    const w = container.clientWidth, h = container.clientHeight;
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.setPixelRatio(this.renderer.getPixelRatio());
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.14, 0.38, 0.88);
+    this.composer.addPass(this.bloom);
+    this.composer.addPass(new OutputPass());
+
     window.addEventListener('resize', () => this.resize());
+  }
+
+  async ready(): Promise<void> {
+    await loadAssets();
+    this.camera.remove(this.vm.root);
+    this.vm = buildViewModel();
+    this.vm.root.visible = false;
+    this.camera.add(this.vm.root);
+    this.mountMap();
+  }
+
+  private mountMap(): void {
+    const assets = getAssets();
+    const src = assets?.map;
+    if (src) {
+      this.dressMap(src);
+      this.scene.add(src);
+    } else {
+      const sand = this.loadRepeat('/textures/ground.jpg', 22, 22);
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(COLS * CELL + 8000, ROWS * CELL + 8000),
+        new THREE.MeshStandardMaterial({ map: sand, roughness: 0.96, color: 0xd9c48a }),
+      );
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.set((COLS * CELL) / 2, -2, (ROWS * CELL) / 2);
+      ground.receiveShadow = true;
+      this.scene.add(ground);
+    }
+    this.buildSiteDecals();
+    this.buildFloorAccents();
+    this.buildGlowDiscs();
+  }
+
+  private dressMap(root: THREE.Object3D): void {
+    const plaster = this.loadAlbedo('/textures/wall.jpg');
+    const sand = this.loadAlbedo('/textures/ground.jpg');
+    const roof = this.loadAlbedo('/textures/concrete.jpg');
+    const wood = this.loadAlbedo('/textures/wood.jpg');
+    const metal = this.loadAlbedo('/textures/metal.jpg');
+    root.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      m.frustumCulled = false;
+      const n = (m.name || m.parent?.name || '').toLowerCase();
+      if (n.includes('desert') || n.includes('cliff')) this.paintMesh(m, sand, 0xe2c98a, 0.97, 0.02, false, true, 0);
+      else if (n.includes('street')) this.paintMesh(m, sand, 0xc8b98a, 0.95, 0.02, false, true, 0);
+      else if (n.includes('curb') || n.includes('crates_stone')) this.paintMesh(m, roof, 0xddd6c8, 0.9, 0.04, true, true, 0);
+      else if (n.includes('bldg_tan')) this.paintMesh(m, plaster, 0xc49a62, 0.9, 0.02, true, true, 0);
+      else if (n.includes('bldg_cream') || n.includes('landmark')) this.paintMesh(m, plaster, 0xe4d3ad, 0.88, 0.02, true, true, 0);
+      else if (n.includes('bldg_white') || n.includes('trim')) this.paintMesh(m, plaster, 0xf0e6d2, 0.86, 0.02, true, true, 0);
+      else if (n.includes('roof')) this.paintMesh(m, roof, 0xc8b890, 0.92, 0.04, true, true, 0);
+      else if (n.includes('door') || n.includes('crates_wood') || n.includes('palm_trunk') || n.includes('pole')) {
+        this.paintMesh(m, wood, 0x8a6232, 0.78, 0.04, true, true, 0);
+      } else if (n.includes('crates_metal') || n.includes('sign')) {
+        this.paintMesh(m, metal, 0x8a9096, 0.42, 0.55, true, true, 0);
+      } else if (n.includes('window')) {
+        this.paintMesh(m, null, 0x14181c, 0.18, 0.35, false, false, 0);
+      } else if (n.includes('palm_leaf')) {
+        this.paintMesh(m, null, 0x3a6a28, 0.78, 0.02, true, false, 0);
+      } else if (n.includes('awn')) {
+        this.paintMesh(m, null, 0x2a2a2a, 0.72, 0.04, true, false, 0);
+      } else {
+        m.castShadow = true;
+        m.receiveShadow = true;
+      }
+    });
+  }
+
+  private paintMesh(
+    mesh: THREE.Mesh,
+    map: THREE.Texture | null,
+    color: number,
+    rough: number,
+    metal: number,
+    cast: boolean,
+    receive: boolean,
+    uvScale: number,
+  ): void {
+    const src = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    const std = (src as THREE.MeshStandardMaterial).clone();
+    std.color.setHex(color);
+    std.map = map;
+    std.roughness = rough;
+    std.metalness = metal;
+    std.envMapIntensity = 0.55;
+    std.needsUpdate = true;
+    mesh.material = std;
+    mesh.castShadow = cast;
+    mesh.receiveShadow = receive;
+    if (map && uvScale > 0) this.applyWorldUVs(mesh, uvScale);
+  }
+
+  private applyWorldUVs(mesh: THREE.Mesh, scale: number): void {
+    const geo = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
+    const pos = geo.attributes.position;
+    const nrm = geo.attributes.normal;
+    if (!pos) return;
+    const uv = new Float32Array(pos.count * 2);
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      let u = x, v = z;
+      if (nrm) {
+        const ax = Math.abs(nrm.getX(i)), ay = Math.abs(nrm.getY(i)), az = Math.abs(nrm.getZ(i));
+        if (ay >= ax && ay >= az) { u = x; v = z; }
+        else if (ax >= az) { u = z; v = y; }
+        else { u = x; v = y; }
+      }
+      uv[i * 2] = u / scale;
+      uv[i * 2 + 1] = v / scale;
+    }
+    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    geo.computeVertexNormals();
+    mesh.geometry = geo;
   }
 
   resize(): void {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
+    this.bloom.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   }
 
   // ---- sky & lights ---------------------------------------------------------
   private buildSky(): void {
-    const c = document.createElement('canvas');
-    c.width = 8; c.height = 256;
-    const g = c.getContext('2d')!;
-    const grad = g.createLinearGradient(0, 0, 0, 256);
-    grad.addColorStop(0, '#04070c');
-    grad.addColorStop(0.42, '#0a1422');
-    grad.addColorStop(0.72, '#16263a');
-    grad.addColorStop(1, '#32445c');
-    g.fillStyle = grad;
-    g.fillRect(0, 0, 8, 256);
-    const tex = new THREE.CanvasTexture(c);
-    const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(4600, 24, 12),
-      new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, fog: false }),
-    );
-    sky.position.y = -600;
+    const sky = new Sky();
+    sky.scale.setScalar(12000);
+    const u = sky.material.uniforms;
+    u['turbidity'].value = 6.4;
+    u['rayleigh'].value = 2.1;
+    u['mieCoefficient'].value = 0.0048;
+    u['mieDirectionalG'].value = 0.82;
+    const sunDir = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(78), THREE.MathUtils.degToRad(148));
+    u['sunPosition'].value.copy(sunDir);
     this.scene.add(sky);
-
-    // faint moon glow for silhouette separation
-    const moon = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: this.radialTex(0x9db8d8, 0.5, 128), transparent: true, fog: false,
-      depthWrite: false, blending: THREE.AdditiveBlending,
-    }));
-    moon.scale.setScalar(1400);
-    moon.position.set(1500, 3200, -2800);
-    this.scene.add(moon);
+    const probe = new Sky();
+    probe.scale.setScalar(40);
+    probe.material.uniforms['turbidity'].value = u['turbidity'].value;
+    probe.material.uniforms['rayleigh'].value = u['rayleigh'].value;
+    probe.material.uniforms['mieCoefficient'].value = u['mieCoefficient'].value;
+    probe.material.uniforms['mieDirectionalG'].value = u['mieDirectionalG'].value;
+    probe.material.uniforms['sunPosition'].value.copy(sunDir);
+    const tmp = new THREE.Scene();
+    tmp.add(probe);
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromScene(tmp, 0.04, 0.1, 100).texture;
+    this.scene.environmentIntensity = 0.55;
+    pmrem.dispose();
   }
 
   private radialTex(color: number, alpha: number, size: number): THREE.Texture {
@@ -122,237 +255,47 @@ export class World {
   }
 
   private buildLights(): void {
-    const hemi = new THREE.HemisphereLight(0xc8d8ee, 0x161a20, 0.75);
+    const hemi = new THREE.HemisphereLight(0xfff3dc, 0x7a6a4c, 0.62);
     this.scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffe2bb, 1.1);
-    key.position.set(900, 2400, -700);
-    this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0x6f9fff, 0.5);
-    fill.position.set(-900, 1600, 1500);
+    const sun = new THREE.DirectionalLight(0xffe2b0, 2.55);
+    sun.position.set(2200, 2800, -1800);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.bias = -0.00018;
+    sun.shadow.normalBias = 0.8;
+    const span = 1200;
+    sun.shadow.camera.left = -span;
+    sun.shadow.camera.right = span;
+    sun.shadow.camera.top = span;
+    sun.shadow.camera.bottom = -span;
+    sun.shadow.camera.near = 400;
+    sun.shadow.camera.far = 7000;
+    sun.shadow.camera.updateProjectionMatrix();
+    const cx = (COLS * CELL) / 2, cz = (ROWS * CELL) / 2;
+    sun.target.position.set(cx, 0, cz);
+    this.scene.add(sun);
+    this.scene.add(sun.target);
+    this.sun = sun;
+    const fill = new THREE.DirectionalLight(0xb7c6d8, 0.28);
+    fill.position.set(-1600, 900, 1500);
     this.scene.add(fill);
-    // site accents (static, cheap)
-    const siteA = new THREE.PointLight(0xff9a4a, 60, 2600, 2);
-    siteA.position.set(27.5 * CELL, 180, 17 * CELL);
-    this.scene.add(siteA);
-    const siteB = new THREE.PointLight(0x57c8ff, 60, 2600, 2);
-    siteB.position.set(5.5 * CELL, 180, 17 * CELL);
-    this.scene.add(siteB);
   }
 
-  // ---- map -------------------------------------------------------------------
-  private buildMap(): void {
-    const groundTex = this.groundTex();
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(COLS * CELL + 4000, ROWS * CELL + 4000),
-      new THREE.MeshStandardMaterial({ map: groundTex, roughness: 0.93, metalness: 0.05 }),
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -1;
-    this.scene.add(ground);
-
-    this.buildWallShell();
-    this.buildProps();
-    this.buildSiteDecals();
-    this.buildFloorAccents();
-    this.buildGlowDiscs();
-  }
-
-  // industrial concrete floor: panel seams + noise per 64-unit cell
-  private groundTex(): THREE.Texture {
-    const S = 256;
-    const c = document.createElement('canvas');
-    c.width = c.height = S;
-    const g = c.getContext('2d')!;
-    g.fillStyle = '#232a32';
-    g.fillRect(0, 0, S, S);
-    // sub-panels
-    g.fillStyle = '#20272e';
-    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
-      if ((i + j) % 2 === 0) g.fillRect(i * 64, j * 64, 64, 64);
-    }
-    // seams
-    g.strokeStyle = '#151a20';
-    g.lineWidth = 3;
-    for (let i = 0; i <= 4; i++) {
-      g.beginPath(); g.moveTo(i * 64, 0); g.lineTo(i * 64, S); g.stroke();
-      g.beginPath(); g.moveTo(0, i * 64); g.lineTo(S, i * 64); g.stroke();
-    }
-    // rivets at corners + grime
-    g.fillStyle = '#2c343d';
-    for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) {
-      g.beginPath(); g.arc(i * 64, j * 64, 3, 0, 7); g.fill();
-    }
-    const rnd = this.rnd;
-    for (let i = 0; i < 900; i++) {
-      const a = rnd();
-      g.fillStyle = a > 0.5 ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.03)';
-      g.fillRect(rnd() * S, rnd() * S, 2, 2);
-    }
-    // dirt along center seams
-    g.strokeStyle = 'rgba(0,0,0,0.12)';
-    g.lineWidth = 1;
-    g.beginPath(); g.moveTo(0, S / 2); g.lineTo(S, S / 2); g.stroke();
-    const t = new THREE.CanvasTexture(c);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.repeat.set(COLS, ROWS);
+  private loadAlbedo(url: string): THREE.Texture {
+    const hit = this.texCache.get(url);
+    if (hit) return hit;
+    const t = new THREE.TextureLoader().load(url);
     t.colorSpace = THREE.SRGBColorSpace;
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.texCache.set(url, t);
     return t;
   }
 
-  private concreteWallTex(): THREE.Texture {
-    const S = 256;
-    const c = document.createElement('canvas');
-    c.width = c.height = S;
-    const g = c.getContext('2d')!;
-    g.fillStyle = '#222a34';
-    g.fillRect(0, 0, S, S);
-    g.fillStyle = '#262f3b';
-    g.fillRect(8, 8, 120, 120); g.fillRect(136, 128, 112, 120);
-    g.strokeStyle = '#1a2129';
-    g.lineWidth = 4;
-    g.strokeRect(4, 4, S - 8, S - 8);
-    // hazard bolt panel along bottom
-    g.save();
-    g.fillStyle = '#3a424d';
-    for (let x = 0; x < S; x += 32) {
-      g.beginPath();
-      g.moveTo(x, S); g.lineTo(x + 16, S); g.lineTo(x + 32, S - 16); g.lineTo(x + 16, S - 16);
-      g.closePath(); g.fill();
-    }
-    g.restore();
-    g.fillStyle = '#4a3426';
-    g.fillRect(0, S - 6, S, 6);
-    const rnd = this.rnd;
-    for (let i = 0; i < 500; i++) {
-      g.fillStyle = rnd() > 0.5 ? 'rgba(0,0,0,0.06)' : 'rgba(200,215,235,0.03)';
-      g.fillRect(rnd() * S, rnd() * S, 2, 2);
-    }
-    const t = new THREE.CanvasTexture(c);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.colorSpace = THREE.SRGBColorSpace;
-    return t;
-  }
-
-  // Merge only the visible wall boundary quads (solid cell faces next to floor)
-  // into one geometry with a shared tiling texture.
-  private buildWallShell(): void {
-    const pos: number[] = [];
-    const nrm: number[] = [];
-    const uv: number[] = [];
-    const quads: { p: number[]; n: number[]; u: number[] }[] = [];
-
-    const H = WALL_H;
-    const addFace = (a: [number, number, number], b: [number, number, number], c: [number, number, number], d: [number, number, number], n: [number, number, number]) => {
-      const u0 = a[0] / CELL, v0 = a[1] / CELL;
-      const u1 = d[0] / CELL, v1 = d[1] / CELL;
-      const q = { p: [...a, ...b, ...c, ...a, ...c, ...d], n, u: [u0, v0, u1, v0, u1, v1, u0, v0, u1, v1, u0, v1] };
-      quads.push(q);
-    };
-
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        if (floorCells[r * COLS + c]) continue; // not a wall cell
-        const x0 = c * CELL, x1 = (c + 1) * CELL;
-        const z0 = r * CELL, z1 = (r + 1) * CELL;
-        // north face (toward -z neighbor)
-        if (r > 0 && floorCells[(r - 1) * COLS + c]) {
-          addFace([x0, 0, z0], [x0, H, z0], [x1, H, z0], [x1, 0, z0], [0, 0, 1]);
-        }
-        // south face (+z)
-        if (r < ROWS - 1 && floorCells[(r + 1) * COLS + c]) {
-          addFace([x1, 0, z1], [x1, H, z1], [x0, H, z1], [x0, 0, z1], [0, 0, -1]);
-        }
-        // west face (-x)
-        if (c > 0 && floorCells[r * COLS + (c - 1)]) {
-          addFace([x0, 0, z1], [x0, H, z1], [x0, H, z0], [x0, 0, z0], [-1, 0, 0]);
-        }
-        // east face (+x)
-        if (c < COLS - 1 && floorCells[r * COLS + (c + 1)]) {
-          addFace([x1, 0, z0], [x1, H, z0], [x1, H, z1], [x1, 0, z1], [1, 0, 0]);
-        }
-      }
-    }
-
-    for (const q of quads) {
-      pos.push(...q.p);
-      nrm.push(...q.n, ...q.n, ...q.n, ...q.n, ...q.n, ...q.n);
-      uv.push(...q.u);
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(nrm), 3));
-    geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
-    const mat = new THREE.MeshStandardMaterial({ map: this.concreteWallTex(), roughness: 0.88, metalness: 0.1 });
-    const walls = new THREE.Mesh(geo, mat);
-    this.scene.add(walls);
-  }
-
-  // crates / barrels / sandbags / containers from CRATES
-  private buildProps(): void {
-    const crateTex = this.crateTex();
-    for (const o of CRATES) {
-      const x = (o.c + 0.5) * CELL, z = (o.r + 0.5) * CELL;
-      const h = o.h;
-      const s = CELL - 6;
-      let mesh: THREE.Mesh;
-      if (o.mat === 2) {
-        // barrel
-        mesh = new THREE.Mesh(
-          new THREE.CylinderGeometry(CELL * 0.3, CELL * 0.32, h - 4, 14),
-          new THREE.MeshStandardMaterial({ color: 0x6b6f5a, roughness: 0.55, metalness: 0.4 }),
-        );
-        mesh.position.set(x, (h - 4) / 2, z);
-        const stripe = new THREE.Mesh(
-          new THREE.CylinderGeometry(CELL * 0.305, CELL * 0.305, h * 0.4, 14),
-          new THREE.MeshStandardMaterial({ color: 0xc94f3d, roughness: 0.6 }),
-        );
-        stripe.position.set(x, h * 0.28, z);
-        this.scene.add(stripe);
-      } else if (o.mat === 1) {
-        // metal container (tall), with ribbed sides
-        mesh = new THREE.Mesh(new THREE.BoxGeometry(s, h, s), new THREE.MeshStandardMaterial({ color: 0x4b5a6b, roughness: 0.5, metalness: 0.55 }));
-        mesh.position.set(x, h / 2, z);
-        const rib = new THREE.Mesh(new THREE.BoxGeometry(s + 2, h, 3), new THREE.MeshStandardMaterial({ color: 0x39434f, roughness: 0.5, metalness: 0.4 }));
-        rib.position.set(x, h / 2, z - s / 2 + 1.5);
-        this.scene.add(rib);
-      } else if (o.mat === 3) {
-        // sandbag/low stack
-        mesh = new THREE.Mesh(new THREE.BoxGeometry(s, h, s), new THREE.MeshStandardMaterial({ color: 0x6b6b52, roughness: 0.95 }));
-        mesh.position.set(x, h / 2, z);
-      } else {
-        mesh = new THREE.Mesh(new THREE.BoxGeometry(s, h, s), new THREE.MeshStandardMaterial({ map: crateTex, roughness: 0.75 }));
-        mesh.position.set(x, h / 2, z);
-        // strap lines on wooden crates
-        const band = new THREE.Mesh(new THREE.BoxGeometry(s + 3, Math.min(h, 10), s + 3), new THREE.MeshStandardMaterial({ color: 0x20242a, roughness: 0.6, metalness: 0.2 }));
-        band.position.set(x, h * 0.72, z);
-        this.scene.add(band);
-      }
-      this.scene.add(mesh);
-    }
-    void CRATE_BOXES;
-  }
-
-  private crateTex(): THREE.Texture {
-    const S = 128;
-    const c = document.createElement('canvas');
-    c.width = c.height = S;
-    const g = c.getContext('2d')!;
-    const rnd = this.rnd;
-    const cols = [0x5c4632, 0x6b5138, 0x53402f];
-    for (let i = 0; i < 6; i++) {
-      g.fillStyle = '#' + cols[Math.floor(rnd() * cols.length)].toString(16).padStart(6, '0');
-      g.fillRect(0, i * (S / 6), S, S / 6);
-      g.fillStyle = 'rgba(0,0,0,0.25)';
-      g.fillRect(0, i * (S / 6), S, 2);
-    }
-    g.strokeStyle = 'rgba(0,0,0,0.4)';
-    g.lineWidth = 4;
-    g.strokeRect(0, 0, S, S);
-    g.strokeStyle = 'rgba(255,255,255,0.08)';
-    g.strokeRect(8, 8, S - 16, S - 16);
-    const t = new THREE.CanvasTexture(c);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.colorSpace = THREE.SRGBColorSpace;
+  private loadRepeat(url: string, rx: number, ry: number): THREE.Texture {
+    const t = this.loadAlbedo(url).clone();
+    t.repeat.set(rx, ry);
+    t.needsUpdate = true;
     return t;
   }
 
@@ -361,7 +304,7 @@ export class World {
     for (const z of PLANT_ZONES) {
       const ring = new THREE.Mesh(
         new THREE.RingGeometry(z.r - 10, z.r + 4, 56),
-        new THREE.MeshBasicMaterial({ color: 0xffb454, transparent: true, opacity: 0.32, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false }),
+        new THREE.MeshBasicMaterial({ color: 0xd9a441, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false }),
       );
       ring.rotation.x = -Math.PI / 2;
       ring.position.set(z.x, 1.2, z.z);
@@ -379,6 +322,35 @@ export class World {
       letter.rotation.x = -Math.PI / 2;
       this.scene.add(letter);
     }
+    this.scene.add(this.wallSign(42.2 * CELL, 78, 18.05 * CELL, 0, 'A', 0xc43b2e));
+    this.scene.add(this.wallSign(5.8 * CELL, 86, 18.05 * CELL, 0, 'B', 0xc43b2e));
+  }
+
+  private wallSign(x: number, y: number, z: number, yaw: number, ch: string, color: number): THREE.Mesh {
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 128;
+    const g = c.getContext('2d')!;
+    g.fillStyle = '#5c6a72';
+    g.fillRect(0, 0, 256, 128);
+    g.fillStyle = '#d8dde0';
+    g.fillRect(8, 8, 240, 112);
+    g.fillStyle = '#' + color.toString(16).padStart(6, '0');
+    g.font = 'bold 88px sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(ch, 188, 68);
+    g.fillStyle = '#2a3338';
+    g.font = 'bold 22px sans-serif';
+    g.fillText(ch === 'A' ? 'SITE A' : 'SITE B', 90, 68);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(56, 28),
+      new THREE.MeshBasicMaterial({ map: t, side: THREE.DoubleSide }),
+    );
+    mesh.position.set(x, y, z);
+    mesh.rotation.y = yaw;
+    return mesh;
   }
 
   private letterSprite(ch: string, color: number): THREE.Sprite {
@@ -442,17 +414,12 @@ export class World {
       this.scene.add(mesh);
       this.glowDiscs.push(mesh);
     };
-    // mid room, plaza, corridors, sites
-    make(16.5 * CELL, 15.5 * CELL, CELL * 3, 0x9fb8ff, 0.5);
-    make(16.5 * CELL, 6 * CELL, CELL * 3.4, 0xffe0b0, 0.5);
-    make(8 * CELL, 22 * CELL, CELL * 2.6, 0x57c8ff, 0.6);
-    make(25 * CELL, 22 * CELL, CELL * 2.6, 0xff9a4a, 0.6);
-    make(16.5 * CELL, 25.5 * CELL, CELL * 3.4, 0x3d9bff, 0.6);
-    make(16.5 * CELL, 2.5 * CELL, CELL * 3.4, 0xff6a3d, 0.6);
-    make(22 * CELL, 12 * CELL, CELL * 2, 0xb9c7e0, 0.45);
-    make(11 * CELL, 12 * CELL, CELL * 2, 0xb9c7e0, 0.45);
-    // glowing strips along the central corridor
-    for (let r = 8; r <= 13; r++) make((16.5 + (r % 2 ? 1.1 : -1.1)) * CELL, r * CELL + 0.5 * CELL, CELL * 0.24, 0x9fe2ff, 0.9);
+    make(23.5 * CELL, 21 * CELL, CELL * 4.2, 0xfff4d2, 0.18);
+    make(23.5 * CELL, 9 * CELL, CELL * 4.6, 0xfff1c4, 0.2);
+    make(PLANT_ZONES[1].x, PLANT_ZONES[1].z, CELL * 3.2, 0xfff6d8, 0.16);
+    make(PLANT_ZONES[0].x, PLANT_ZONES[0].z, CELL * 3.2, 0xfff6d8, 0.16);
+    make(23.5 * CELL, 36 * CELL, CELL * 3.8, 0xfff4d2, 0.14);
+    make(23.5 * CELL, 3.5 * CELL, CELL * 3.8, 0xfff4d2, 0.14);
   }
 
   // ---- soft decal texture helpers ------------------------------------------
@@ -481,15 +448,31 @@ export class World {
     const rig = makeCharacter({ team, seed });
     const group = new THREE.Group();
     group.add(rig.group);
+    group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; }
+    });
     this.actorRoot.add(group);
     const tag = this.makeTag(name, team);
     if (tag) {
-      tag.position.y = 90;
+      tag.position.y = 78;
       rig.group.add(tag);
     }
-    a = { group, rig, tag, px: 0, pz: 0, phase: 0, recoil: 0, visible: false, alive: 1 };
+    a = { group, rig, tag, px: 0, pz: 0, phase: 0, recoil: 0, visible: false, alive: 1, wpn: '' };
     this.actors.set(id, a);
     return a;
+  }
+
+  private worldGun(id: string): THREE.Object3D | null {
+    const assets = getAssets();
+    const tpl = assets?.weapons.get(id);
+    if (!tpl) return null;
+    const gun = fitWeapon(tpl.scene, 9.5, weaponYaw(id));
+    gun.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh) m.castShadow = true;
+    });
+    return gun;
   }
 
   private makeTag(name: string, team: number): THREE.Sprite | null {
@@ -521,13 +504,13 @@ export class World {
   removeActor(id: string): void {
     const a = this.actors.get(id);
     if (!a) return;
-    this.scene.remove(a.group);
+    this.actorRoot.remove(a.group);
     this.actors.delete(id);
     this.hidden.delete(id);
   }
 
   reset(): void {
-    for (const a of this.actors.values()) this.scene.remove(a.group);
+    for (const a of this.actors.values()) this.actorRoot.remove(a.group);
     this.actors.clear();
     this.hidden.clear();
     for (const s of this.smokesById.values()) this.scene.remove(s);
@@ -586,7 +569,12 @@ export class World {
         pitch: p.pitch,
         fire: a.recoil,
         phase: a.phase,
-      });
+        using: p.using,
+      }, dt);
+      if (p.curW && p.curW !== a.wpn) {
+        a.wpn = p.curW;
+        a.rig.setWeapon(this.worldGun(p.curW));
+      }
       if (a.tag) a.tag.visible = true;
       seen.add(p.id);
     }
@@ -597,10 +585,15 @@ export class World {
   }
 
   // ---- camera ---------------------------------------------------------------
-  setCam(pos: { x: number; y: number; z: number }, yaw: number, pitch: number, duck: number): void {
+  setCam(pos: { x: number; y: number; z: number }, yaw: number, pitch: number, duck: number, zoom = 0): void {
     this.camera.position.set(pos.x, pos.y + (duck ? EYE_DUCK : EYE), pos.z);
     this.camera.rotation.y = yaw;
     this.camera.rotation.x = pitch;
+    const fov = 78 - zoom * 36;
+    if (Math.abs(this.camera.fov - fov) > 0.05) {
+      this.camera.fov = fov;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   get eyeY(): number { return EYE; }
@@ -638,10 +631,14 @@ export class World {
   // ---- first-person viewmodel ----------------------------------------------
   vmSet(w: string, team: number): void { this.vm.setWeapon(w, team); }
   vmShow(v: boolean): void { this.vm.root.visible = v; }
-  vmUpdate(dt: number, opts: { speed: number; duck: boolean; using: boolean }): void {
-    this.vm.update(dt, { speed: opts.speed, duck: opts.duck ? 1 : 0, alive: this.vm.root.visible, using: opts.using });
+  vmUpdate(dt: number, opts: { speed: number; duck: boolean; using: boolean; aim?: number; reload?: number }): void {
+    this.vm.update(dt, {
+      speed: opts.speed, duck: opts.duck ? 1 : 0, alive: this.vm.root.visible,
+      using: opts.using, aim: opts.aim, reload: opts.reload,
+    });
   }
   vmKick(power: number): void { this.vm.kick(power); }
+  vmReload(dur: number): void { this.vm.reload(dur); }
 
   // flash at the tip of the held gun (own view) + recoil the viewmodel
   ownMuzzle(x: number, y: number, z: number, big: boolean, power: number): void {
@@ -790,7 +787,14 @@ export class World {
   }
 
   render(): void {
-    this.renderer.render(this.scene, this.camera);
+    if (this.sun) {
+      const x = this.camera.position.x, z = this.camera.position.z;
+      this.sun.target.position.set(x, 0, z);
+      this.sun.position.set(x + 2200, 2800, z - 1800);
+      this.sun.target.updateMatrixWorld();
+      this.sun.updateMatrixWorld();
+    }
+    this.composer.render();
   }
 
   rayBlocked(from: THREE.Vector3, dir: THREE.Vector3): number {

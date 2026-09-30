@@ -5,7 +5,7 @@ import { MatchSim, SimPlayer, BTN } from './sim.ts';
 import { WEAPONS } from './weapons.ts';
 import { rayCollide } from './geo.ts';
 import {
-  navPassable, COLS, cellWorldX, cellWorldZ, worldToCell,
+  navPassable, COLS, ROWS, cellWorldX, cellWorldZ, worldToCell, PLANT_ZONES, ANCHORS,
 } from './mapdef.ts';
 import { clamp, dist2D } from './mathv.ts';
 
@@ -83,16 +83,17 @@ export class BotBrain {
     const start = sr * COLS + sc, goal = tr * COLS + tc;
     if (start === goal) return [{ x: tx, z: tz }];
     const open = [start];
-    const came = new Int32Array(COLS * 200).fill(-1);
-    const gScore = new Float64Array(COLS * 400).fill(Infinity);
+    const gridN = COLS * ROWS;
+    const came = new Int32Array(gridN).fill(-1);
+    const gScore = new Float64Array(gridN).fill(Infinity);
     gScore[start] = 0;
-    const closed = new Uint8Array(COLS * 400);
+    const closed = new Uint8Array(gridN);
     const h = (i: number) => {
       const c = i % COLS, r = (i / COLS) | 0;
       return Math.hypot(c - tc, r - tr);
     };
     let guard = 0;
-    while (open.length && guard++ < 2500) {
+    while (open.length && guard++ < 8000) {
       // pop min f
       let bi = 0, bf = Infinity;
       for (let i = 0; i < open.length; i++) {
@@ -107,7 +108,7 @@ export class BotBrain {
       const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
       for (const [dx, dz] of dirs) {
         const nc = cc + dx, nr = cr + dz;
-        if (nc < 0 || nr < 0 || nc >= COLS || nr >= 30) continue;
+        if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
         if (!navPassable(nc, nr)) continue;
         if (dx !== 0 && dz !== 0 && !(navPassable(cc + dx, cr) && navPassable(cc, cr + dz))) continue;
         const ni = nr * COLS + nc;
@@ -264,14 +265,20 @@ export class BotBrain {
     const inRange = d < 2600;
     const skillFire = this.wantFire(p, bs, d);
     let fire = inRange && skillFire && aim.settled;
+    // hold fire when recoil climbs: bots burst instead of spraying into the dirt
+    const recoilCap = 0.35 + (1 - this.skill) * 2.5;
+    if (fire && p.recoilAmt > recoilCap) fire = false;
     if (fire && !this.fireAllowed(p, d)) fire = false;
     if (fire && p.curW === 'knife' && d > 90) {
       this.ensureWeapon(p, bs, d);
       fire = false;
     }
+    // plant feet while shooting so movement spread doesn't ruin accuracy
+    const cat = catName(p.curW);
+    const advance = !fire && cat !== 'sniper' && d > this.effRange(cat);
     this.setCmd(p, bs, {
-      f: clamp(0.6 * (aim.rangeClose ? 0 : 0.2), -1, 1),
-      s: clamp(sd * sm, -1, 1),
+      f: fire || aim.rangeClose ? 0 : (advance ? 0.85 : clamp(0.6 * 0.2, -1, 1)),
+      s: fire || advance ? clamp(sd * 0.25, -1, 1) : clamp(sd * sm, -1, 1),
       aimYaw: aim.yaw, aimPitch: aim.pitch, fire,
     });
     if (fire && sim.now - p.lastShotAt > 0.3) bs.targetT = 2.5;
@@ -308,14 +315,23 @@ export class BotBrain {
     return best ? { enemy: best, d: bd } : null;
   }
 
+  private effRange(cat: string): number {
+    if (cat === 'melee') return 110;
+    if (cat === 'shotgun') return 420;
+    if (cat === 'pistol') return 650;
+    if (cat === 'smg') return 850;
+    if (cat === 'lmg') return 1100;
+    if (cat === 'sniper') return 3000;
+    return 1200; // rifle
+  }
+
   private wantFire(p: SimPlayer, bs: BotState, d: number): boolean {
     const w = WEAPONS[p.curW];
     if (!w) return false;
     const cat = catName(p.curW);
     if (cat === 'melee') return d < 110;
     if (cat === 'sniper') return d > 240 || !p.onGround;
-    if (d < 1400) return true;
-    return rnd() < 0.5;
+    return d < this.effRange(cat);
   }
 
   private computeAim(p: SimPlayer, e: SimPlayer, d: number, bs: BotState): { yaw: number; pitch: number; settled: boolean; rangeClose: boolean } {
@@ -391,8 +407,8 @@ export class BotBrain {
   }
   private siteAt(x: number, z: number): number {
     const a = SITEA, b = SITEB;
-    if (dist2D(x, z, a.x, a.z) < 170) return 1;
-    if (dist2D(x, z, b.x, b.z) < 170) return 2;
+    if (dist2D(x, z, a.x, a.z) < 210) return 1;
+    if (dist2D(x, z, b.x, b.z) < 210) return 2;
     return 0;
   }
   private dangerNear(p: SimPlayer, r: number): boolean {
@@ -572,15 +588,16 @@ function catName(id: string): string {
   return 'pistol';
 }
 const UTIL_CATS: Record<string, 1> = { flash: 1, frag: 1, smoke: 1, fire: 1, decoy: 1 };
-const SITEA = { x: cellWorldX(27.5), z: cellWorldZ(17) };
-const SITEB = { x: cellWorldX(5.5), z: cellWorldZ(17) };
+const SITEA = { x: PLANT_ZONES[0].x, z: PLANT_ZONES[0].z };
+const SITEB = { x: PLANT_ZONES[1].x, z: PLANT_ZONES[1].z };
 const PLANTXY = [SITEA, SITEB];
-const DEF_A = { x: cellWorldX(26), z: cellWorldZ(19.5) };
-const DEF_B = { x: cellWorldX(7), z: cellWorldZ(19.5) };
-const MID_A = { x: cellWorldX(18.5), z: cellWorldZ(12.5) };
-const MID_B = { x: cellWorldX(15.5), z: cellWorldZ(19.5) };
+const DEF_A = { x: ANCHORS.find((a) => a.kind === 'cta')!.x, z: ANCHORS.find((a) => a.kind === 'cta')!.z };
+const DEF_B = { x: ANCHORS.find((a) => a.kind === 'ctb')!.x, z: ANCHORS.find((a) => a.kind === 'ctb')!.z };
+const MID_A = { x: ANCHORS.find((a) => a.kind === 'along')!.x, z: ANCHORS.find((a) => a.kind === 'along')!.z };
+const MID_B = { x: ANCHORS.find((a) => a.kind === 'blong')!.x, z: ANCHORS.find((a) => a.kind === 'blong')!.z };
 const ANCHOR_PTS = [DEF_A, DEF_B, MID_A, MID_B, SITEA, SITEB,
-  { x: cellWorldX(16.5), z: cellWorldZ(6) }, { x: cellWorldX(28), z: cellWorldZ(10) },
+  { x: ANCHORS.find((a) => a.kind === 'plaza')!.x, z: ANCHORS.find((a) => a.kind === 'plaza')!.z },
+  { x: ANCHORS.find((a) => a.kind === 'mid')!.x, z: ANCHORS.find((a) => a.kind === 'mid')!.z },
 ];
 
 function pointSegDist(ax: number, az: number, bx: number, bz: number, px: number, pz: number): number {

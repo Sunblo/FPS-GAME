@@ -173,7 +173,9 @@ export interface CInput {
   f: number; // forward -1..1
   s: number; // strafe -1..1
   b: number; // buttons bitmask
-  mx?: number; my?: number; // mouse dx for server-side sanity? unused
+  mx?: number; my?: number;
+  px?: number; py?: number; pz?: number;
+  pvx?: number; pvy?: number; pvz?: number;
 }
 
 export const BTN = { JUMP: 1, CROUCH: 2, WALK: 4, FIRE: 8, ZOOM: 16, USE: 32 } as const;

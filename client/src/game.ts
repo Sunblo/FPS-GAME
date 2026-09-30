@@ -2,16 +2,17 @@
 import { World } from './render.ts';
 import { Sfx } from './audio.ts';
 import { buildHud, buildBuyPanel, Radar, type Hud, type MenuStartArgs } from './ui.ts';
-import { PracticeGame, OnlineGame, type GameDriver, type DriverView } from './game/driver.ts';
+import { OnlineGame, type GameDriver, type DriverView } from './game/driver.ts';
 import type { PState } from '../../shared/protocol.ts';
 import type { MatchEvt } from '../../shared/sim.ts';
 import { BTN } from '../../shared/sim.ts';
 import { PLANT_TIME, DEFUSE_TIME } from '../../shared/constants.ts';
-import { PLANT_ZONES } from '../../shared/mapdef.ts';
-import { catOf } from '../../shared/weapons.ts';
+import { PLANT_ZONES, plantZoneAt } from '../../shared/mapdef.ts';
+import { catOf, weaponById } from '../../shared/weapons.ts';
 
 const DIGIT_TOOL: Record<string, string> = {
-  '1': 'knife', '2': 'pistol', '3': 'primary', '4': 'flash', '5': 'smoke', '6': 'frag', '7': 'fire', '8': 'decoy',
+  Digit1: 'primary', Digit2: 'pistol', Digit3: 'knife', Digit4: 'flash',
+  Digit5: 'smoke', Digit6: 'frag', Digit7: 'fire', Digit8: 'decoy',
 };
 
 function vmPower(w: string): number {
@@ -61,9 +62,18 @@ export class Game {
   private sbOpen = false;
   private lastBars = { hp: -1, armor: -1 };
   private lastWpn = { w: '', mag: -2, res: -2 };
+  private lastMoney = -1;
   private useStart = -1;
   private useKind: 'plant' | 'defuse' = 'plant';
   private joined = false;
+  private zoomHeld = false;
+  private zoom = 0;
+  private reloadT = 0;
+  private reloadDur = 2.6;
+  private stepAcc = 0;
+  private lastStepT = 0;
+  private camKick = 0;
+  private wheelSlot = 2;
   onExit: () => void = () => {};
 
   constructor(stage: HTMLElement, uiRoot: HTMLElement) {
@@ -81,6 +91,7 @@ export class Game {
   start(opts: MenuStartArgs): void {
     this.disposeDriver();
     this.world.reset();
+    this.audio.setMuted(false);
     this.audio.unlock();
     this.selfId = '';
     this.specTarget = '';
@@ -90,21 +101,29 @@ export class Game {
     this.mouse = { yaw: 0, pitch: 0 };
     this.buy = false;
     this.sbOpen = false;
+    this.zoom = 0;
+    this.zoomHeld = false;
+    this.reloadT = 0;
+    this.lastMoney = -1;
+    this.lastBars = { hp: -1, armor: -1 };
+    this.lastWpn = { w: '', mag: -2, res: -2 };
     this.setBuy(false);
     this.setSb(false);
-    this.hud.setConnState(opts.mode === 'online' ? 'CONNECTING…' : 'CLICK TO PLAY');
+    this.hud.setConnState('LOADING MODELS…');
     this.hud.flash(0.4);
 
     const host = location.host;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    if (opts.mode === 'practice') {
-      this.driver = new PracticeGame(opts.name, opts.teamSize, opts.skill);
-      this.onJoined();
-    } else {
+    void this.world.ready().then(() => {
+      this.hud.setConnState('CONNECTING…');
       const g = new OnlineGame({ name: opts.name, code: opts.code, teamSize: opts.teamSize, url: `${proto}://${host}/ws` });
       this.driver = g;
-      g.ready.then(() => this.onJoined()).catch(() => {});
-    }
+      g.ready.then(() => this.onJoined()).catch(() => {
+        this.hud.setConnState('CONNECTION FAILED');
+      });
+    }).catch(() => {
+      this.hud.setConnState('MODEL LOAD FAILED');
+    });
   }
 
   private onJoined(): void {
@@ -124,21 +143,27 @@ export class Game {
 
   private disposeDriver(): void {
     if (this.driver) { this.driver.dispose(); this.driver = null; }
+    this.joined = false;
     this.hudRoot.classList.remove('show');
   }
 
   // ---- input binding --------------------------------------------------------
   private bindKeys(): void {
     document.addEventListener('keydown', (e) => {
-      if (!this.locked && !this.over) return;
+      if (this.over) return;
+      if (e.code === 'KeyB' && this.joined) {
+        this.buy = !this.buy; this.setBuy(this.buy); e.preventDefault(); return;
+      }
+      if (e.code === 'Escape' && this.buy) {
+        this.buy = false; this.setBuy(false); e.preventDefault(); return;
+      }
+      if (!this.locked) return;
       if (e.repeat) return;
       this.keys[e.code] = true;
       const d = this.driver;
       if (!d) return;
       if (e.code === 'KeyR') d.action({ t: 'reload' });
-      else if (e.code === 'KeyB') { this.buy = !this.buy; this.setBuy(this.buy); }
       else if (e.code === 'Tab') { this.sbOpen = true; this.setSb(true); }
-      else if (e.code === 'KeyE') { /* use is fire bit; nothing here */ }
       else if (e.code.startsWith('Digit')) this.digitTool(e.code, d);
       if (['Space', 'Tab'].includes(e.code)) e.preventDefault();
     });
@@ -148,14 +173,30 @@ export class Game {
     });
     document.addEventListener('mousemove', (e) => {
       if (!this.locked) return;
-      const sens = (this.keys['ControlLeft'] || this.keys['ControlRight']) ? 1.0 : 2.3;
+      const walk = this.keys['ControlLeft'] || this.keys['ControlRight'] || this.keys['ShiftLeft'] || this.keys['ShiftRight'];
+      const sens = (walk ? 1.05 : 2.15) * (this.zoom > 0.4 ? 0.42 : 1);
       this.mouse.yaw -= e.movementX * 0.0021 * sens;
       this.mouse.pitch -= e.movementY * 0.0021 * sens;
       const lim = Math.PI / 2 - 0.02;
       this.mouse.pitch = Math.max(-lim, Math.min(lim, this.mouse.pitch));
     });
-    document.addEventListener('mousedown', (e) => { if (e.button === 0) this.fireHeld = true; });
-    document.addEventListener('mouseup', (e) => { if (e.button === 0) this.fireHeld = false; });
+    document.addEventListener('mousedown', (e) => {
+      if (e.button === 0) this.fireHeld = true;
+      if (e.button === 2) this.zoomHeld = true;
+    });
+    document.addEventListener('mouseup', (e) => {
+      if (e.button === 0) this.fireHeld = false;
+      if (e.button === 2) this.zoomHeld = false;
+    });
+    document.addEventListener('contextmenu', (e) => { if (this.locked) e.preventDefault(); });
+    document.addEventListener('wheel', (e) => {
+      if (!this.locked || this.over || this.buy) return;
+      const d = this.driver;
+      if (!d) return;
+      this.wheelSlot = (this.wheelSlot + (e.deltaY > 0 ? 1 : -1) + 3) % 3;
+      d.action({ t: 'slot', slot: this.wheelSlot });
+      e.preventDefault();
+    }, { passive: false });
   }
 
   private bindPointer(): void {
@@ -163,6 +204,9 @@ export class Game {
     ov.addEventListener('click', () => {
       if (this.buy) { this.buy = false; this.setBuy(false); }
       this.tryLock();
+    });
+    this.world.container.addEventListener('click', () => {
+      if (!this.buy && this.joined && !this.over) this.tryLock();
     });
     document.addEventListener('pointerlockchange', () => {
       this.locked = document.pointerLockElement != null;
@@ -179,18 +223,24 @@ export class Game {
   private digitTool(code: string, d: GameDriver): void {
     const id = DIGIT_TOOL[code];
     if (!id) return;
-    if (id === 'knife') d.action({ t: 'slot', slot: 0 });
+    if (id === 'primary') d.action({ t: 'slot', slot: 2 });
     else if (id === 'pistol') d.action({ t: 'slot', slot: 1 });
-    else if (id === 'primary') d.action({ t: 'slot', slot: 2 });
+    else if (id === 'knife') d.action({ t: 'slot', slot: 0 });
     else d.action({ t: 'weapon', id });
   }
 
   private setBuy(v: boolean): void {
     this.hudRoot.querySelector('#buypanel')?.classList.toggle('hidden', !v);
     if (v) {
+      if (this.locked) document.exitPointerLock?.();
       const me = this.self();
       const box = this.hudRoot.querySelector('#buybox') as HTMLElement;
-      if (box) buildBuyPanel(box, me, { onBuy: (item) => this.driver?.action({ t: 'buy', item }) });
+      if (box) buildBuyPanel(box, me, { onBuy: (item) => {
+        this.driver?.action({ t: 'buy', item });
+        requestAnimationFrame(() => { if (this.buy) this.setBuy(true); });
+      } });
+    } else {
+      this.tryLock();
     }
   }
 
@@ -211,13 +261,22 @@ export class Game {
     this.lastT = t;
     const d = this.driver;
     if (!d) { this.world.render(); return; }
+    const view0 = d.view;
+    if (!this.joined && !view0.selfId) { this.world.render(); return; }
+
+    if (!this.over) {
+      const moving = this.locked;
+      d.setInput({
+        seq: 0,
+        yaw: this.mouse.yaw,
+        pitch: this.mouse.pitch,
+        f: moving ? this.forward() : 0,
+        s: moving ? this.strafe() : 0,
+        b: moving ? this.buttons() : 0,
+      });
+    }
     d.step(dt);
     const view = d.view;
-    if (!this.joined && !view.selfId) { this.world.render(); return; }
-
-    if (this.locked && !this.over) {
-      d.setInput({ seq: 0, yaw: this.mouse.yaw, pitch: this.mouse.pitch, f: this.forward(), s: this.strafe(), b: this.buttons() });
-    }
 
     const me = this.self();
     this.camControl(view, me, dt);
@@ -227,8 +286,11 @@ export class Game {
     this.world.updateSmokes(view.smokes, view.simNow);
     this.world.updateFires(view.fires, view.simNow);
     this.world.tickFx(dt);
+    this.updateZoom(me, dt);
     this.updateHud(view, me);
+    this.updateHint(view, me);
     this.updateUse(view, me);
+    this.updateSteps(me, dt);
 
     const evs = d.events();
     for (const e of evs) this.onEvent(e, view);
@@ -248,6 +310,7 @@ export class Game {
     if (this.keys['ShiftLeft'] || this.keys['ShiftRight']) b |= BTN.WALK;
     if (this.fireHeld) b |= BTN.FIRE;
     if (this.keys['KeyE']) b |= BTN.USE;
+    if (this.zoomHeld) b |= BTN.ZOOM;
     return b;
   }
   private forward(): number {
@@ -271,17 +334,18 @@ export class Game {
       // snapshot velocity so the own view does not lag a full tick behind input,
       // then track it with a fast (near-crisp) easing. Snap instantly across large
       // gaps (spawn/teleport/round reset) so the camera never sweeps the map.
-      const age = Math.max(0, Math.min(view.simAge, 0.06));
-      const tx = me.x + me.vx * age;
+      const tx = me.x;
       const ty = me.y;
-      const tz = me.z + me.vz * age;
+      const tz = me.z;
       const dx = tx - this.cam.x, dy = ty - this.cam.y, dz = tz - this.cam.z;
       const dist = Math.hypot(dx, dy, dz);
-      const k = dist > 240 ? 1 : 1 - Math.exp(-55 * Math.min(dt, 0.05));
+      const k = dist > 80 ? 1 : 1 - Math.exp(-28 * Math.min(dt, 0.05));
       this.cam.x += dx * k;
       this.cam.y += dy * k;
       this.cam.z += dz * k;
-      this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch, me.duck ? 1 : 0);
+      this.camKick *= Math.exp(-12 * dt);
+      if (this.camKick < 0.002) this.camKick = 0;
+      this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch + this.camKick * 0.018, me.duck ? 1 : 0, this.zoom);
       return;
     }
     if (!me) return;
@@ -298,13 +362,17 @@ export class Game {
       this.mouse.yaw += angDiff(cur.yaw, this.mouse.yaw) * 0.12;
       this.mouse.pitch += (cur.pitch - this.mouse.pitch) * 0.12;
     }
-    this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch, 0);
+    this.world.setCam(this.cam, this.mouse.yaw, this.mouse.pitch, 0, 0);
   }
 
   // ---- first-person held weapon ----------------------------------------------
   private updateVm(view: DriverView, me: PState | undefined, dt: number): void {
     void view;
     const w = this.world;
+    this.reloadT = Math.max(0, this.reloadT - dt);
+    const rl = this.reloadT > 0
+      ? Math.sin((1 - this.reloadT / Math.max(this.reloadDur, 0.01)) * Math.PI)
+      : 0;
     if (me && me.alive && me.curW) {
       if (me.curW !== this.vmW || me.team !== this.vmTeam) {
         this.vmW = me.curW;
@@ -312,7 +380,10 @@ export class Game {
         w.vmSet(me.curW, me.team);
       }
       w.vmShow(true);
-      w.vmUpdate(dt, { speed: Math.hypot(me.vx, me.vz), duck: me.duck === 1, using: me.using === 1 });
+      w.vmUpdate(dt, {
+        speed: Math.hypot(me.vx, me.vz), duck: me.duck === 1, using: me.using === 1,
+        aim: this.zoom, reload: rl,
+      });
     } else {
       if (this.vmW) { this.vmW = ''; this.vmTeam = -1; }
       w.vmShow(false);
@@ -328,6 +399,10 @@ export class Game {
       if (me.hp !== this.lastBars.hp || me.armor !== this.lastBars.armor) {
         this.hud.setBars(me.hp, me.armor);
         this.lastBars = { hp: me.hp, armor: me.armor };
+      }
+      if (me.money !== this.lastMoney) {
+        this.hud.setMoney(me.money);
+        this.lastMoney = me.money;
       }
       if (me.curW !== this.lastWpn.w || me.mag !== this.lastWpn.mag || me.res !== this.lastWpn.res) {
         this.hud.setWeapon(me.curW, me.mag, me.res);
@@ -346,6 +421,55 @@ export class Game {
 
   private lastWinner: number | null = null;
   private hudKey = '';
+
+  private updateZoom(me: PState | undefined, dt: number): void {
+    const want = !!(me && me.alive && this.zoomHeld && this.locked && !this.buy);
+    const target = want ? 1 : 0;
+    const k = 1 - Math.exp(-(want ? 14 : 11) * dt);
+    this.zoom += (target - this.zoom) * k;
+    if (this.zoom < 0.004) this.zoom = 0;
+    // only true scoped weapons get the scope overlay; everything else just
+    // raises the sights and tightens the field of view.
+    const scoped = !!weaponById(me?.curW ?? '')?.scope;
+    this.hud.scope(scoped && this.zoom > 0.5);
+    this.world.vmShow(!!(me && me.alive && !me.using));
+  }
+
+  private updateHint(view: DriverView, me: PState | undefined): void {
+    if (!me) { this.hud.setHint(''); return; }
+    if (!me.alive) { this.hud.setHint('SPECTATING'); return; }
+    const h = view.header;
+    if (this.buy) { this.hud.setHint(''); return; }
+    if (h.ph === 'freeze' || h.ph === 'warmup') {
+      this.hud.setHint('PRESS B TO OPEN ARMORY');
+      return;
+    }
+    if (me.hasBomb && plantZoneAt(me.x, me.z)) {
+      this.hud.setHint('HOLD E TO PLANT');
+      return;
+    }
+    if (h.plant > 0 && me.team !== h.atkTeam) {
+      const z = PLANT_ZONES[h.plant - 1];
+      if (z && Math.hypot(me.x - z.x, me.z - z.z) < z.r) {
+        this.hud.setHint('HOLD E TO DEFUSE');
+        return;
+      }
+    }
+    this.hud.setHint('');
+  }
+
+  private updateSteps(me: PState | undefined, dt: number): void {
+    if (!me || !me.alive || !this.locked) { this.stepAcc = 0; return; }
+    const spd = Math.hypot(me.vx, me.vz);
+    if (spd < 40 || me.duck) { this.stepAcc = 0; return; }
+    const interval = spd > 200 ? 0.32 : 0.46;
+    this.stepAcc += dt;
+    if (this.stepAcc >= interval && this.lastT - this.lastStepT > 180) {
+      this.stepAcc = 0;
+      this.lastStepT = this.lastT;
+      this.audio.footstep(spd > 180);
+    }
+  }
 
   private updateUse(view: DriverView, me: PState | undefined): void {
     const el = this.hudRoot.querySelector('#progwrap') as HTMLElement;
@@ -383,6 +507,13 @@ export class Game {
         if (isVic) { this.vign = 1; this.audio.hurt(); }
         break;
       }
+      case 'hit':
+        if (e.to === this.selfId) {
+          this.hud.crosshair(true);
+          setTimeout(() => this.hud.crosshair(false), E.hs ? 140 : 80);
+          this.audio.hitmark(!!E.hs);
+        }
+        break;
       case 'dmg':
         if (e.to === this.selfId) {
           const amt = Number(E.amt ?? 10);
@@ -412,6 +543,7 @@ export class Game {
         const me = this.self();
         const won = me ? me.team === E.winner : false;
         this.hud.banner(won ? 'win' : 'loss', won ? 'VICTORY' : 'DEFEAT', `MATCH FINAL ${view.header.scr[0]} - ${view.header.scr[1]}`);
+        this.hud.setHint('RETURNING TO MENU');
         this.audio.bombPlanted();
         this.over = true;
         if (this.locked) document.exitPointerLock?.();
@@ -478,7 +610,8 @@ export class Game {
           const w = me?.curW ?? '';
           const m = this.world.gunMouth();
           this.world.ownMuzzle(m.x, m.y, m.z, w === 'obliterator' || w === 'raptor', vmPower(w));
-          this.audio.gunshot(w, 0.5);
+          this.audio.gunshot(w, 0.55);
+          this.camKick = Math.min(1.4, this.camKick + 0.55 * vmPower(w));
         }
         break;
       case 'tracer': {
@@ -492,8 +625,17 @@ export class Game {
         this.world.impact(x1, y1, z1);
         break;
       }
-      case 'reload': if (e.to === this.selfId) this.audio.reload(); break;
-      case 'reload_done': if (e.to === this.selfId) this.audio.reloadDone(); break;
+      case 'reload':
+        if (e.to === this.selfId) {
+          this.audio.reload();
+          this.reloadDur = weaponById(this.lastWpn.w)?.reload ?? 2.6;
+          this.reloadT = this.reloadDur;
+          this.world.vmReload(this.reloadDur);
+        }
+        break;
+      case 'reload_done':
+        if (e.to === this.selfId) { this.audio.reloadDone(); this.reloadT = 0; }
+        break;
       case 'empty': if (e.to === this.selfId) this.audio.dry(); break;
       case 'throw': case 'thrown': if (e.to === this.selfId) this.audio.throwSnd(); break;
       case 'channel_beep': if (e.to === this.selfId) { if (E.kind === 'plant') this.audio.plantBeep(true); else this.audio.defuseBeep(); } break;
